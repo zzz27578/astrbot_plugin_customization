@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>欢迎私聊工作台</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>欢迎私聊工作台</h1>
+          <p id="runtime">正在加载</p>
+        </div>
+        <div class="actions">
+          <button id="refresh" type="button">刷新</button>
+          <button id="save" type="button" class="primary">保存设置</button>
+        </div>
+      </header>
+
+      <nav class="tabs" aria-label="页面分区">
+        <button class="tab active" data-target="overview" type="button">概览</button>
+        <button class="tab" data-target="materials" type="button">素材库</button>
+        <button class="tab" data-target="groups" type="button">群控制</button>
+        <button class="tab" data-target="policy" type="button">发送策略</button>
+        <button class="tab" data-target="fallback" type="button">失败兜底</button>
+        <button class="tab" data-target="logs" type="button">通知日志</button>
+      </nav>
+
+      <section id="overview" class="panel active">
+        <div class="grid two">
+          <section class="block">
+            <h2>运行状态</h2>
+            <div class="switch-row">
+              <label class="switch">
+                <input id="enabled" type="checkbox" />
+                <span></span>
+              </label>
+              <div>
+                <strong>插件总开关</strong>
+                <p>关闭后不处理新人入群事件</p>
+              </div>
+            </div>
+            <div class="metric-row">
+              <div>
+                <span>队列</span>
+                <strong id="queueSize">0</strong>
+              </div>
+              <div>
+                <span>卡片</span>
+                <strong id="activeCard">未设置</strong>
+              </div>
+              <div>
+                <span>记录</span>
+                <strong id="activeRecord">未设置</strong>
+              </div>
+              <div>
+                <span>图片</span>
+                <strong id="activeImage">未设置</strong>
+              </div>
+            </div>
+          </section>
+
+          <section class="block">
+            <h2>测试发送</h2>
+            <label>
+              测试接收 QQ
+              <input id="testReceiver" inputmode="numeric" placeholder="QQ 号" />
+            </label>
+            <button id="testSend" type="button">发送当前三条消息</button>
+            <p id="testResult" class="muted"></p>
+          </section>
+        </div>
+      </section>
+
+      <section id="materials" class="panel">
+        <div class="grid three">
+          <section class="block">
+            <div class="block-head">
+              <h2>QQ 卡片</h2>
+              <span class="tag">引用命令采集</span>
+            </div>
+            <div id="cards" class="list"></div>
+          </section>
+
+          <section class="block">
+            <div class="block-head">
+              <h2>聊天记录</h2>
+              <span class="tag">合并转发</span>
+            </div>
+            <div id="records" class="list"></div>
+          </section>
+
+          <section class="block">
+            <div class="block-head">
+              <h2>图片</h2>
+              <span class="tag">上传或引用</span>
+            </div>
+            <label class="upload">
+              <input id="imageUpload" type="file" accept="image/png,image/jpeg,image/webp,image/gif" />
+              <span>上传图片</span>
+            </label>
+            <div id="images" class="list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="groups" class="panel">
+        <div class="grid two">
+          <section class="block">
+            <h2>启用范围</h2>
+            <label>
+              启用模式
+              <select id="mode">
+                <option value="all">所有群启用，黑名单排除</option>
+                <option value="whitelist">仅白名单群启用</option>
+                <option value="disabled">全部关闭</option>
+              </select>
+            </label>
+            <label>
+              白名单群
+              <textarea id="whitelistGroups" rows="6"></textarea>
+            </label>
+            <label>
+              黑名单群
+              <textarea id="blacklistGroups" rows="6"></textarea>
+            </label>
+          </section>
+
+          <section class="block">
+            <h2>管理员</h2>
+            <label>
+              管理员 QQ
+              <textarea id="adminQqList" rows="8"></textarea>
+            </label>
+          </section>
+        </div>
+      </section>
+
+      <section id="policy" class="panel">
+        <div class="grid two">
+          <section class="block">
+            <h2>发送顺序</h2>
+            <div id="order" class="order-list"></div>
+            <label>
+              消息间隔（秒）
+              <input id="sendInterval" type="number" min="0" max="30" step="0.5" />
+            </label>
+          </section>
+
+          <section class="block">
+            <h2>重试与去重</h2>
+            <label class="check">
+              <input id="retryEnabled" type="checkbox" />
+              私聊失败后重试
+            </label>
+            <label>
+              重试次数
+              <input id="retryCount" type="number" min="0" max="5" />
+            </label>
+            <label>
+              重试间隔（秒）
+              <input id="retryInterval" type="number" min="0" max="600" step="1" />
+            </label>
+            <label class="check">
+              <input id="dedupeEnabled" type="checkbox" />
+              同群同人去重
+            </label>
+            <label>
+              去重时间（分钟）
+              <input id="dedupeMinutes" type="number" min="0" max="10080" />
+            </label>
+          </section>
+        </div>
+      </section>
+
+      <section id="fallback" class="panel">
+        <div class="grid two">
+          <section class="block">
+            <h2>降级私聊</h2>
+            <label class="check">
+              <input id="cardFallbackEnabled" type="checkbox" />
+              卡片失败后发送备用文本
+            </label>
+            <textarea id="cardFallbackText" rows="3"></textarea>
+            <label class="check">
+              <input id="recordFallbackEnabled" type="checkbox" />
+              聊天记录失败后发送备用文本
+            </label>
+            <textarea id="recordFallbackText" rows="3"></textarea>
+            <label class="check">
+              <input id="imageFallbackEnabled" type="checkbox" />
+              图片失败后发送备用文本
+            </label>
+            <textarea id="imageFallbackText" rows="3"></textarea>
+          </section>
+
+          <section class="block">
+            <h2>群内兜底</h2>
+            <label class="check">
+              <input id="groupFallbackEnabled" type="checkbox" />
+              开启群内兜底提醒
+            </label>
+            <label>
+              触发条件
+              <select id="groupFallbackMode">
+                <option value="all_failed">三条私聊全部失败</option>
+                <option value="any_failed">任一消息失败</option>
+              </select>
+            </label>
+            <label class="check">
+              <input id="groupFallbackAt" type="checkbox" />
+              @ 新人
+            </label>
+            <label>
+              提醒内容
+              <textarea id="groupFallbackTemplate" rows="4"></textarea>
+            </label>
+          </section>
+        </div>
+      </section>
+
+      <section id="logs" class="panel">
+        <div class="grid two">
+          <section class="block">
+            <h2>异常通知</h2>
+            <label class="check">
+              <input id="notifyAdminPrivate" type="checkbox" />
+              私聊管理员 QQ
+            </label>
+            <label class="check">
+              <input id="notifyAdminGroup" type="checkbox" />
+              发送到管理群
+            </label>
+            <label>
+              管理群号
+              <input id="notifyGroupId" inputmode="numeric" />
+            </label>
+            <label class="check">
+              <input id="notifyOnSuccess" type="checkbox" />
+              成功也通知
+            </label>
+            <label>
+              日志保留条数
+              <input id="maxLogs" type="number" min="10" max="500" />
+            </label>
+          </section>
+
+          <section class="block wide">
+            <h2>最近记录</h2>
+            <div id="logsList" class="logs"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
