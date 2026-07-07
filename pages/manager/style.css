@@ -307,7 +307,7 @@ textarea {
 
 .metric-row {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
   gap: 10px;
   margin-top: 22px;
 }
@@ -426,6 +426,10 @@ textarea {
 
 .upload input {
   display: none;
+}
+
+.text-material textarea {
+  min-height: 160px;
 }
 
 .order-list {

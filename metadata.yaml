@@ -1,9 +1,9 @@
 name: astrbot_plugin_customization
 display_name: 欢迎私聊定制
-desc: 新人入群后自动私聊 QQ 卡片、聊天记录和图片，并提供插件页面管理素材、群控制、兜底与通知。
-short_desc: 新人入群自动私聊三条欢迎素材。
+desc: 新人入群后自动私聊 QQ 卡片、聊天记录、图片和文字，并提供插件页面管理素材、群控制、兜底与通知。
+short_desc: 新人入群自动私聊当前配置的欢迎素材。
 author: zzz27578
-version: 0.1.3
+version: 0.1.4
 repo: https://github.com/zzz27578/astrbot_plugin_customization
 support_platforms:
   - aiocqhttp

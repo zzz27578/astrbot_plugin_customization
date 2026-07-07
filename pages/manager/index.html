@@ -59,6 +59,10 @@
                 <span>图片</span>
                 <strong id="activeImage">未设置</strong>
               </div>
+              <div>
+                <span>文字</span>
+                <strong id="activeText">0 段</strong>
+              </div>
             </div>
           </section>
 
@@ -68,7 +72,7 @@
               测试接收 QQ
               <input id="testReceiver" inputmode="numeric" placeholder="QQ 号" />
             </label>
-            <button id="testSend" type="button">发送当前三条消息</button>
+            <button id="testSend" type="button">发送当前配置</button>
             <p id="testResult" class="muted"></p>
           </section>
         </div>
@@ -102,6 +106,17 @@
               <span>上传图片</span>
             </label>
             <div id="images" class="list"></div>
+          </section>
+
+          <section class="block full text-material">
+            <div class="block-head">
+              <h2>文字发送</h2>
+              <span class="tag">分行分段</span>
+            </div>
+            <label>
+              文字内容
+              <textarea id="textContent" rows="7" placeholder="每一行会作为一段文字私聊发送"></textarea>
+            </label>
           </section>
         </div>
       </section>
@@ -211,7 +226,7 @@
             <label>
               触发条件
               <select id="groupFallbackMode">
-                <option value="all_failed">三条私聊全部失败</option>
+                <option value="all_failed">全部私聊失败</option>
                 <option value="any_failed">任一消息失败</option>
                 <option value="on_join">有新人进入</option>
               </select>

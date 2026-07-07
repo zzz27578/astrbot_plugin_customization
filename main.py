@@ -21,6 +21,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 PLUGIN_NAME = "astrbot_plugin_customization"
 STORE_VERSION = 1
+SEND_STEPS = {"card", "record", "image", "text"}
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -28,7 +29,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "mode": "all",
     "whitelist_groups": [],
     "blacklist_groups": [],
-    "send_order": ["card", "record", "image"],
+    "send_order": ["card", "record", "image", "text"],
     "send_interval_seconds": 1.5,
     "retry_enabled": True,
     "retry_count": 1,
@@ -50,6 +51,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "record_fallback_text": "",
     "image_fallback_enabled": False,
     "image_fallback_text": "",
+    "text_content": "",
     "active_card_id": "",
     "active_record_id": "",
     "active_image_id": "",
@@ -201,8 +203,9 @@ class WelcomeCustomizationPlugin(Star):
         normalized["send_order"] = [
             item
             for item in normalized.get("send_order", [])
-            if item in {"card", "record", "image"}
-        ] or ["card", "record", "image"]
+            if item in SEND_STEPS
+        ] or ["card", "record", "image", "text"]
+        normalized["text_content"] = str(normalized.get("text_content") or "")
         normalized["send_interval_seconds"] = self._bounded_float(
             normalized.get("send_interval_seconds"),
             0,
@@ -489,7 +492,8 @@ class WelcomeCustomizationPlugin(Star):
                 origin_group_id=group_id,
             )
             step_results.append(result)
-            await asyncio.sleep(float(self.store["settings"]["send_interval_seconds"]))
+            if not result.get("skipped"):
+                await asyncio.sleep(float(self.store["settings"]["send_interval_seconds"]))
 
         ok = all(item["ok"] for item in step_results)
         failed_steps = [item for item in step_results if not item["ok"]]
@@ -516,7 +520,14 @@ class WelcomeCustomizationPlugin(Star):
                 )
             return
 
-        await self._run_fallbacks(bot, group_id, user_id, routing, failed_steps)
+        await self._run_fallbacks(
+            bot,
+            group_id,
+            user_id,
+            routing,
+            failed_steps,
+            step_results,
+        )
 
     async def _send_step_with_retry(
         self,
@@ -530,9 +541,38 @@ class WelcomeCustomizationPlugin(Star):
         if self.store["settings"].get("retry_enabled", True):
             attempts += int(self.store["settings"].get("retry_count", 0))
         last_error = ""
+        use_missing_fallback = False
+        fallback_text = ""
+        if step not in SEND_STEPS:
+            return {
+                "step": step,
+                "ok": False,
+                "attempts": 0,
+                "error": f"{step}: 未知发送步骤",
+            }
+        if not self._step_has_config(step):
+            fallback_text = self._fallback_text_for_step(step)
+            if not fallback_text:
+                return {
+                    "step": step,
+                    "ok": True,
+                    "attempts": 0,
+                    "error": "",
+                    "skipped": True,
+                }
+            use_missing_fallback = True
         for index in range(attempts):
             try:
-                await self._send_step(bot, user_id, step, routing, origin_group_id)
+                if use_missing_fallback:
+                    await self._send_private_payload(
+                        bot,
+                        user_id,
+                        [{"type": "text", "data": {"text": fallback_text}}],
+                        routing,
+                        origin_group_id,
+                    )
+                else:
+                    await self._send_step(bot, user_id, step, routing, origin_group_id)
                 return {"step": step, "ok": True, "attempts": index + 1, "error": ""}
             except Exception as e:
                 last_error = str(e)
@@ -545,6 +585,7 @@ class WelcomeCustomizationPlugin(Star):
             "ok": False,
             "attempts": attempts,
             "error": f"{step}: {last_error}",
+            "fallback": use_missing_fallback,
         }
 
     async def _send_step(
@@ -594,7 +635,58 @@ class WelcomeCustomizationPlugin(Star):
                 origin_group_id,
             )
             return
+        if step == "text":
+            segments = self._text_segments()
+            if not segments:
+                raise ValueError("未配置文字内容")
+            for index, text in enumerate(segments):
+                await self._send_private_payload(
+                    bot,
+                    user_id,
+                    [{"type": "text", "data": {"text": text}}],
+                    routing,
+                    origin_group_id,
+                )
+                if index + 1 < len(segments):
+                    await asyncio.sleep(
+                        float(self.store["settings"].get("send_interval_seconds", 1.5)),
+                    )
+            return
         raise ValueError(f"未知发送步骤：{step}")
+
+    def _step_has_config(self, step: str) -> bool:
+        if step == "card":
+            return bool(self._active_item("cards", "active_card_id"))
+        if step == "record":
+            record = self._active_item("records", "active_record_id")
+            return bool(record and record.get("nodes"))
+        if step == "image":
+            return bool(self._active_item("images", "active_image_id"))
+        if step == "text":
+            return bool(self._text_segments())
+        return False
+
+    def _fallback_text_for_step(self, step: str) -> str:
+        settings = self.store["settings"]
+        mapping = {
+            "card": ("card_fallback_enabled", "card_fallback_text"),
+            "record": ("record_fallback_enabled", "record_fallback_text"),
+            "image": ("image_fallback_enabled", "image_fallback_text"),
+        }
+        keys = mapping.get(step)
+        if not keys:
+            return ""
+        enabled_key, text_key = keys
+        if not settings.get(enabled_key):
+            return ""
+        return str(settings.get(text_key, "")).strip()
+
+    def _text_segments(self) -> list[str]:
+        return [
+            item.strip()
+            for item in str(self.store["settings"].get("text_content", "")).splitlines()
+            if item.strip()
+        ]
 
     async def _send_private_payload(
         self,
@@ -637,6 +729,7 @@ class WelcomeCustomizationPlugin(Star):
         user_id: str,
         routing: dict[str, Any],
         failed_steps: list[dict[str, Any]],
+        step_results: list[dict[str, Any]] | None = None,
     ) -> None:
         fallback_texts = []
         failed_names = {item["step"] for item in failed_steps}
@@ -672,8 +765,11 @@ class WelcomeCustomizationPlugin(Star):
 
         if settings.get("group_fallback_enabled"):
             mode = settings.get("group_fallback_mode", "all_failed")
-            should_send = mode in {"any_failed", "on_join"} or len(failed_steps) >= len(
-                settings.get("send_order", []),
+            active_results = [
+                item for item in (step_results or []) if not item.get("skipped")
+            ]
+            should_send = mode in {"any_failed", "on_join"} or (
+                bool(failed_steps) and len(failed_steps) >= len(active_results)
             )
             if should_send:
                 await self._send_group_fallback(bot, group_id, user_id, routing)
@@ -952,10 +1048,19 @@ class WelcomeCustomizationPlugin(Star):
         raw = getattr(event.message_obj, "raw_message", None)
         if hasattr(raw, "get") and raw.get("self_id"):
             routing["self_id"] = raw.get("self_id")
+        results: list[dict[str, Any]] = []
         for step in self.store["settings"]["send_order"]:
-            await self._send_step(bot, target, step, routing)
-            await asyncio.sleep(float(self.store["settings"]["send_interval_seconds"]))
-        return f"已向 {target} 发送测试欢迎私聊。"
+            result = await self._send_step_with_retry(bot, target, step, routing)
+            results.append(result)
+            if not result.get("skipped"):
+                await asyncio.sleep(float(self.store["settings"]["send_interval_seconds"]))
+        failed = [item for item in results if not item["ok"]]
+        if failed:
+            return "测试发送失败：" + "；".join(item["error"] for item in failed)
+        sent_count = len([item for item in results if not item.get("skipped")])
+        if sent_count <= 0:
+            return "当前没有可发送项，已跳过测试发送。"
+        return f"已向 {target} 发送当前配置，共 {sent_count} 项。"
 
     def _status_text(self) -> str:
         settings = self.store["settings"]
@@ -967,6 +1072,7 @@ class WelcomeCustomizationPlugin(Star):
                 f"卡片：{self._active_name('cards', 'active_card_id')}",
                 f"聊天记录：{self._active_name('records', 'active_record_id')}",
                 f"图片：{self._active_name('images', 'active_image_id')}",
+                f"文字段落：{len(self._text_segments())}",
                 f"白名单群：{', '.join(settings['whitelist_groups']) or '空'}",
                 f"黑名单群：{', '.join(settings['blacklist_groups']) or '空'}",
                 f"管理员 QQ：{', '.join(settings['admin_qq_list']) or '空'}",
@@ -1378,10 +1484,27 @@ class WelcomeCustomizationPlugin(Star):
         bot = self._get_aiocqhttp_bot()
         if bot is None:
             return error_response("aiocqhttp platform is not online", status_code=503)
+        results: list[dict[str, Any]] = []
         for step in self.store["settings"]["send_order"]:
-            await self._send_step(bot, target, step, {})
-            await asyncio.sleep(float(self.store["settings"]["send_interval_seconds"]))
-        return json_response({"sent": True})
+            result = await self._send_step_with_retry(bot, target, step, {})
+            results.append(result)
+            if not result.get("skipped"):
+                await asyncio.sleep(float(self.store["settings"]["send_interval_seconds"]))
+        failed = [item for item in results if not item["ok"]]
+        if failed:
+            return error_response(
+                "；".join(item["error"] for item in failed),
+                status_code=500,
+            )
+        sent_count = len([item for item in results if not item.get("skipped")])
+        return json_response(
+            {
+                "sent": sent_count > 0,
+                "sent_count": sent_count,
+                "skipped_count": len(results) - sent_count,
+                "results": results,
+            },
+        )
 
     async def api_upload_image(self):
         files = await request.files()

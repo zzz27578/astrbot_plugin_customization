@@ -4,12 +4,14 @@ const labels = {
   card: "卡片",
   record: "聊天记录",
   image: "图片",
+  text: "文字",
 };
 
 const orderLabels = {
   card: "QQ 卡片",
   record: "聊天记录",
   image: "图片",
+  text: "文字",
 };
 
 let state = null;
@@ -54,6 +56,7 @@ function render() {
   $("activeCard").textContent = activeName(toMap(state.cards), settings.active_card_id);
   $("activeRecord").textContent = activeName(toMap(state.records), settings.active_record_id);
   $("activeImage").textContent = activeName(toMap(state.images), settings.active_image_id);
+  $("activeText").textContent = `${textSegments(settings.text_content).length} 段`;
 
   setValue("enabled", settings.enabled);
   setValue("mode", settings.mode);
@@ -72,6 +75,7 @@ function render() {
   setValue("recordFallbackText", settings.record_fallback_text);
   setValue("imageFallbackEnabled", settings.image_fallback_enabled);
   setValue("imageFallbackText", settings.image_fallback_text);
+  setValue("textContent", settings.text_content);
   setValue("groupFallbackEnabled", settings.group_fallback_enabled);
   setValue("groupFallbackMode", settings.group_fallback_mode);
   setValue("groupFallbackAt", settings.group_fallback_at);
@@ -127,6 +131,7 @@ function readSettings() {
     record_fallback_text: $("recordFallbackText").value,
     image_fallback_enabled: $("imageFallbackEnabled").checked,
     image_fallback_text: $("imageFallbackText").value,
+    text_content: $("textContent").value,
     group_fallback_enabled: $("groupFallbackEnabled").checked,
     group_fallback_mode: $("groupFallbackMode").value,
     group_fallback_at: $("groupFallbackAt").checked,
@@ -144,7 +149,7 @@ function renderOrder(order) {
   const root = $("order");
   root.innerHTML = "";
   const selected = new Set(order || []);
-  for (const step of ["card", "record", "image"]) {
+  for (const step of ["card", "record", "image", "text"]) {
     const row = document.createElement("label");
     row.className = "order-row";
     row.innerHTML = `
@@ -234,6 +239,13 @@ function renderLogs(logs) {
 function formatTime(seconds) {
   if (!seconds) return "";
   return new Date(seconds * 1000).toLocaleString();
+}
+
+function textSegments(value) {
+  return String(value || "")
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function escapeHtml(value) {
@@ -334,8 +346,11 @@ $("testSend").addEventListener("click", async () => {
   const qq = $("testReceiver").value.trim();
   $("testResult").textContent = "发送中";
   try {
-    await bridge.apiPost("test", { qq });
-    $("testResult").textContent = "测试消息已发送";
+    await bridge.apiPost("settings", { settings: readSettings() });
+    const result = await bridge.apiPost("test", { qq });
+    $("testResult").textContent = result.sent
+      ? `测试已发送，实际发送 ${result.sent_count} 项`
+      : "当前没有可发送项，已跳过";
   } catch (error) {
     $("testResult").textContent = error.message;
   }
