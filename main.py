@@ -281,25 +281,6 @@ class WelcomeCustomizationPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def on_any_event(self, event: AstrMessageEvent):
-        manual_args = self._manual_command_args(event)
-        if manual_args is not None:
-            if not self._is_operator(event):
-                event.stop_event()
-                yield event.plain_result("没有权限使用欢迎私聊管理命令。")
-                return
-            if not manual_args or manual_args[0] in {"帮助", "help", "?"}:
-                event.stop_event()
-                yield event.plain_result(self._help_text())
-                return
-            try:
-                text = await self._dispatch_command(event, manual_args)
-            except Exception as e:
-                logger.exception("欢迎私聊命令执行失败。")
-                text = f"执行失败：{e}"
-            event.stop_event()
-            yield event.plain_result(text)
-            return
-
         raw = getattr(event.message_obj, "raw_message", None)
         if not self._is_group_increase(raw):
             return
@@ -337,65 +318,105 @@ class WelcomeCustomizationPlugin(Star):
             },
         )
 
-    @filter.command("欢迎", alias={"welcome"})
-    async def welcome_command(self, event: AstrMessageEvent):
+    @filter.command("帮助", alias={"help"})
+    async def help_command(self, event: AstrMessageEvent):
+        yield event.plain_result(self._help_text())
+
+    @filter.command("状态", alias={"status"})
+    async def status_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用欢迎私聊管理命令。")
+            yield event.plain_result("没有权限使用管理命令。")
             return
+        yield event.plain_result(self._status_text())
 
-        args = self._command_args(event)
-        if not args or args[0] in {"帮助", "help", "?"}:
-            yield event.plain_result(self._help_text())
+    @filter.command("测试", alias={"test"})
+    async def test_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            yield event.plain_result("没有权限使用管理命令。")
             return
+        args = self._command_args(event, {"测试", "test"})
+        target = args[0] if args else event.get_sender_id()
+        yield event.plain_result(await self._test_send(event, target))
 
-        try:
-            text = await self._dispatch_command(event, args)
-        except Exception as e:
-            logger.exception("欢迎私聊命令执行失败。")
-            text = f"执行失败：{e}"
-        yield event.plain_result(text)
+    @filter.command("启用", alias={"enable"})
+    async def enable_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            yield event.plain_result("没有权限使用管理命令。")
+            return
+        args = self._command_args(event, {"启用", "enable"})
+        yield event.plain_result(self._enable_group(event, args[0] if args else "当前群"))
 
-    async def _dispatch_command(self, event: AstrMessageEvent, args: list[str]) -> str:
-        cmd = self._normalize_command_word(args[0])
-        if cmd == "状态":
-            return self._status_text()
-        if cmd == "测试":
-            target = args[1] if len(args) > 1 else event.get_sender_id()
-            return await self._test_send(event, target)
-        if cmd == "启用":
-            return self._enable_group(event, args[1] if len(args) > 1 else "当前群")
-        if cmd == "禁用":
-            return self._disable_group(event, args[1] if len(args) > 1 else "当前群")
-        if cmd == "模式" and len(args) > 1:
-            return self._set_mode(args[1])
-        if cmd == "卡片":
-            return await self._card_command(event, args[1:])
-        if cmd == "记录":
-            return await self._record_command(event, args[1:])
-        if cmd == "图片":
-            return await self._image_command(event, args[1:])
-        if cmd == "管理员":
-            return self._admin_command(args[1:])
-        if cmd == "通知":
-            return self._toggle_command("notify_admin_private", args[1:])
-        if cmd == "群内兜底":
-            return self._toggle_command("group_fallback_enabled", args[1:])
-        return "未知命令。发送 /欢迎 帮助 查看内置指令。"
+    @filter.command("禁用", alias={"disable"})
+    async def disable_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            yield event.plain_result("没有权限使用管理命令。")
+            return
+        args = self._command_args(event, {"禁用", "disable"})
+        yield event.plain_result(self._disable_group(event, args[0] if args else "当前群"))
 
-    def _manual_command_args(self, event: AstrMessageEvent) -> list[str] | None:
+    @filter.command("模式", alias={"mode"})
+    async def mode_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            yield event.plain_result("没有权限使用管理命令。")
+            return
+        args = self._command_args(event, {"模式", "mode"})
+        if not args:
+            yield event.plain_result("用法：/模式 all|whitelist|disabled")
+            return
+        yield event.plain_result(self._set_mode(args[0]))
+
+    @filter.command("卡片", alias={"card"})
+    async def card_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            yield event.plain_result("没有权限使用管理命令。")
+            return
+        args = self._command_args(event, {"卡片", "card"})
+        yield event.plain_result(await self._card_command(event, args))
+
+    @filter.command("记录", alias={"record", "forward"})
+    async def record_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            yield event.plain_result("没有权限使用管理命令。")
+            return
+        args = self._command_args(event, {"记录", "record", "forward"})
+        yield event.plain_result(await self._record_command(event, args))
+
+    @filter.command("图片", alias={"image", "img"})
+    async def image_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            yield event.plain_result("没有权限使用管理命令。")
+            return
+        args = self._command_args(event, {"图片", "image", "img"})
+        yield event.plain_result(await self._image_command(event, args))
+
+    @filter.command("管理员", alias={"admin"})
+    async def admin_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            yield event.plain_result("没有权限使用管理命令。")
+            return
+        args = self._command_args(event, {"管理员", "admin"})
+        yield event.plain_result(self._admin_command(args))
+
+    @filter.command("通知", alias={"notify"})
+    async def notify_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            yield event.plain_result("没有权限使用管理命令。")
+            return
+        args = self._command_args(event, {"通知", "notify"})
+        yield event.plain_result(self._toggle_command("notify_admin_private", args))
+
+    @filter.command("群内兜底", alias={"fallback", "group_fallback"})
+    async def group_fallback_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            yield event.plain_result("没有权限使用管理命令。")
+            return
+        args = self._command_args(event, {"群内兜底", "fallback", "group_fallback"})
+        yield event.plain_result(self._toggle_command("group_fallback_enabled", args))
+
+    def _command_args(self, event: AstrMessageEvent, names: set[str]) -> list[str]:
         text = re.sub(r"\s+", " ", event.get_message_str().strip())
-        if not text:
-            return None
-        for prefix in ("/欢迎", "！欢迎", "!欢迎", ".欢迎", "。欢迎", "欢迎", "/welcome", "!welcome", ".welcome", "welcome"):
-            if text == prefix:
-                return []
-            if text.startswith(prefix + " "):
-                return self._split_args(text[len(prefix) :].strip())
-        return None
-
-    def _command_args(self, event: AstrMessageEvent) -> list[str]:
-        text = re.sub(r"\s+", " ", event.get_message_str().strip())
-        text = re.sub(r"^[/!！。.]?(欢迎|welcome)\b", "", text, count=1).strip()
+        for name in sorted(names, key=len, reverse=True):
+            text = re.sub(rf"^[/!！。.]?{re.escape(name)}\b", "", text, count=1).strip()
         if not text:
             return []
         return self._split_args(text)
@@ -406,26 +427,6 @@ class WelcomeCustomizationPlugin(Star):
             return shlex.split(text)
         except ValueError:
             return text.split()
-
-    @staticmethod
-    def _normalize_command_word(word: str) -> str:
-        aliases = {
-            "status": "状态",
-            "test": "测试",
-            "enable": "启用",
-            "disable": "禁用",
-            "mode": "模式",
-            "card": "卡片",
-            "record": "记录",
-            "forward": "记录",
-            "image": "图片",
-            "img": "图片",
-            "admin": "管理员",
-            "notify": "通知",
-            "group_fallback": "群内兜底",
-            "fallback": "群内兜底",
-        }
-        return aliases.get(word.lower(), word)
 
     def _is_operator(self, event: AstrMessageEvent) -> bool:
         sender = str(event.get_sender_id())
@@ -732,7 +733,7 @@ class WelcomeCustomizationPlugin(Star):
 
     async def _card_command(self, event: AstrMessageEvent, args: list[str]) -> str:
         if not args:
-            return "用法：/欢迎 卡片 添加 名称；/欢迎 卡片 使用 名称；/欢迎 卡片 列表；/欢迎 卡片 删除 名称"
+            return "用法：/卡片 添加 名称；/卡片 使用 名称；/卡片 列表；/卡片 删除 名称"
         action = self._normalize_action_word(args[0])
         if action == "添加":
             name = args[1] if len(args) > 1 else f"卡片{len(self.store['cards']) + 1}"
@@ -755,7 +756,7 @@ class WelcomeCustomizationPlugin(Star):
 
     async def _record_command(self, event: AstrMessageEvent, args: list[str]) -> str:
         if not args:
-            return "用法：/欢迎 记录 添加 名称；/欢迎 记录 使用 名称；/欢迎 记录 列表；/欢迎 记录 删除 名称"
+            return "用法：/记录 添加 名称；/记录 使用 名称；/记录 列表；/记录 删除 名称"
         action = self._normalize_action_word(args[0])
         if action == "添加":
             name = args[1] if len(args) > 1 else f"聊天记录{len(self.store['records']) + 1}"
@@ -780,7 +781,7 @@ class WelcomeCustomizationPlugin(Star):
 
     async def _image_command(self, event: AstrMessageEvent, args: list[str]) -> str:
         if not args:
-            return "用法：/欢迎 图片 添加 名称；/欢迎 图片 使用 名称；/欢迎 图片 列表；/欢迎 图片 删除 名称"
+            return "用法：/图片 添加 名称；/图片 使用 名称；/图片 列表；/图片 删除 名称"
         action = self._normalize_action_word(args[0])
         if action == "添加":
             name = args[1] if len(args) > 1 else f"图片{len(self.store['images']) + 1}"
@@ -884,7 +885,7 @@ class WelcomeCustomizationPlugin(Star):
         if args:
             args[0] = self._normalize_action_word(args[0])
         if len(args) < 2 or args[0] not in {"添加", "删除"}:
-            return "用法：/欢迎 管理员 添加 QQ；/欢迎 管理员 删除 QQ"
+            return "用法：/管理员 添加 QQ；/管理员 删除 QQ"
         admins = self.store["settings"]["admin_qq_list"]
         qq = str(args[1]).strip()
         if args[0] == "添加" and qq not in admins:
@@ -955,20 +956,20 @@ class WelcomeCustomizationPlugin(Star):
     def _help_text(self) -> str:
         return (
             "欢迎私聊内置指令\n"
-            "/欢迎 状态\n"
-            "/欢迎 测试 [QQ]\n"
-            "/欢迎 模式 all|whitelist|disabled\n"
-            "/欢迎 启用 当前群|群号\n"
-            "/欢迎 禁用 当前群|群号\n"
-            "/欢迎 卡片 添加 名称（回复 QQ 卡片）\n"
-            "/欢迎 卡片 使用/列表/删除 名称\n"
-            "/欢迎 记录 添加 名称（回复消息，追加为合并转发节点）\n"
-            "/欢迎 记录 使用/列表/删除 名称\n"
-            "/欢迎 图片 添加 名称（回复图片）\n"
-            "/欢迎 图片 使用/列表/删除 名称\n"
-            "/欢迎 管理员 添加/删除 QQ\n"
-            "/欢迎 通知 开|关\n"
-            "/欢迎 群内兜底 开|关"
+            "/状态\n"
+            "/测试 [QQ]\n"
+            "/模式 all|whitelist|disabled\n"
+            "/启用 当前群|群号\n"
+            "/禁用 当前群|群号\n"
+            "/卡片 添加 名称（回复 QQ 卡片）\n"
+            "/卡片 使用/列表/删除 名称\n"
+            "/记录 添加 名称（回复消息，追加为合并转发节点）\n"
+            "/记录 使用/列表/删除 名称\n"
+            "/图片 添加 名称（回复图片）\n"
+            "/图片 使用/列表/删除 名称\n"
+            "/管理员 添加/删除 QQ\n"
+            "/通知 开|关\n"
+            "/群内兜底 开|关"
         )
 
     async def _extract_card_json(self, event: AstrMessageEvent) -> str:
