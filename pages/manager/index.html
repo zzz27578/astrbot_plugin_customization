@@ -129,11 +129,8 @@
           </section>
 
           <section class="block">
-            <h2>管理员</h2>
-            <label>
-              管理员 QQ
-              <textarea id="adminQqList" rows="8"></textarea>
-            </label>
+            <h2>运行边界</h2>
+            <p class="muted">白名单模式只响应名单内群；黑名单始终优先排除。千人大群建议使用白名单逐步放量。</p>
           </section>
         </div>
       </section>
@@ -172,6 +169,15 @@
               <input id="dedupeMinutes" type="number" min="0" max="10080" />
             </label>
           </section>
+
+          <section class="block full">
+            <h2>核心稳定性</h2>
+            <label>
+              AstrBot 工具调用轮数上限
+              <input id="maxAgentStep" type="number" min="1" max="200" />
+            </label>
+            <p class="muted">此项写入 AstrBot 的 Agent 工具轮数上限；新人私聊发送由本插件队列执行，不依赖 LLM 思考。</p>
+          </section>
         </div>
       </section>
 
@@ -207,6 +213,7 @@
               <select id="groupFallbackMode">
                 <option value="all_failed">三条私聊全部失败</option>
                 <option value="any_failed">任一消息失败</option>
+                <option value="on_join">有新人进入</option>
               </select>
             </label>
             <label class="check">
@@ -225,6 +232,10 @@
         <div class="grid two">
           <section class="block">
             <h2>异常通知</h2>
+            <label>
+              管理员 QQ
+              <textarea id="adminQqList" rows="5"></textarea>
+            </label>
             <label class="check">
               <input id="notifyAdminPrivate" type="checkbox" />
               私聊管理员 QQ
@@ -248,7 +259,10 @@
           </section>
 
           <section class="block wide">
-            <h2>最近记录</h2>
+            <div class="section-title-row">
+              <h2>最近记录</h2>
+              <button id="clearLogs" class="small danger" type="button">清空</button>
+            </div>
             <div id="logsList" class="logs"></div>
           </section>
         </div>

@@ -82,6 +82,7 @@ function render() {
   setValue("notifyOnSuccess", settings.notify_on_success);
   setValue("maxLogs", settings.max_logs);
   setValue("testReceiver", settings.test_receiver_qq);
+  setValue("maxAgentStep", state.astrbot?.max_agent_step ?? 30);
 
   renderOrder(settings.send_order);
   renderMaterials("cards", state.cards, settings.active_card_id, "card");
@@ -258,9 +259,34 @@ $("refresh").addEventListener("click", async () => {
 });
 
 $("save").addEventListener("click", async () => {
-  await bridge.apiPost("settings", { settings: readSettings() });
-  await loadState();
-  showToast("设置已保存");
+  const button = $("save");
+  button.disabled = true;
+  try {
+    await bridge.apiPost("settings", { settings: readSettings() });
+    await bridge.apiPost("astrbot/max-agent-step", {
+      max_agent_step: Number($("maxAgentStep").value),
+    });
+    await loadState();
+    showToast("设置已保存");
+  } catch (error) {
+    showToast(error.message || "保存失败");
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("clearLogs").addEventListener("click", async () => {
+  const button = $("clearLogs");
+  button.disabled = true;
+  try {
+    await bridge.apiPost("logs/clear", {});
+    await loadState();
+    showToast("最近记录已清空");
+  } catch (error) {
+    showToast(error.message || "清空失败");
+  } finally {
+    button.disabled = false;
+  }
 });
 
 document.body.addEventListener("click", async (event) => {

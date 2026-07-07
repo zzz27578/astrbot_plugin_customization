@@ -42,7 +42,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "notify_on_success": False,
     "group_fallback_enabled": False,
     "group_fallback_mode": "all_failed",
-    "group_fallback_at": True,
+    "group_fallback_at": False,
     "group_fallback_template": "欢迎加入，请检查机器人私聊或查看群公告。",
     "card_fallback_enabled": False,
     "card_fallback_text": "",
@@ -124,6 +124,18 @@ class WelcomeCustomizationPlugin(Star):
             ["POST"],
             "Upload a welcome image",
         )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/logs/clear",
+            self.api_clear_logs,
+            ["POST"],
+            "Clear welcome delivery logs",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/astrbot/max-agent-step",
+            self.api_save_max_agent_step,
+            ["POST"],
+            "Save AstrBot max agent step",
+        )
 
     async def initialize(self) -> None:
         self._ensure_worker()
@@ -181,7 +193,7 @@ class WelcomeCustomizationPlugin(Star):
         )
         normalized["group_fallback_mode"] = (
             normalized["group_fallback_mode"]
-            if normalized["group_fallback_mode"] in {"all_failed", "any_failed"}
+            if normalized["group_fallback_mode"] in {"all_failed", "any_failed", "on_join"}
             else "all_failed"
         )
         for key in ("whitelist_groups", "blacklist_groups", "admin_qq_list"):
@@ -320,19 +332,19 @@ class WelcomeCustomizationPlugin(Star):
 
     @filter.command("帮助", alias={"help"})
     async def help_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            return
         yield event.plain_result(self._help_text())
 
     @filter.command("状态", alias={"status"})
     async def status_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用管理命令。")
             return
         yield event.plain_result(self._status_text())
 
     @filter.command("测试", alias={"test"})
     async def test_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用管理命令。")
             return
         args = self._command_args(event, {"测试", "test"})
         target = args[0] if args else event.get_sender_id()
@@ -341,7 +353,6 @@ class WelcomeCustomizationPlugin(Star):
     @filter.command("启用", alias={"enable"})
     async def enable_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用管理命令。")
             return
         args = self._command_args(event, {"启用", "enable"})
         yield event.plain_result(self._enable_group(event, args[0] if args else "当前群"))
@@ -349,7 +360,6 @@ class WelcomeCustomizationPlugin(Star):
     @filter.command("禁用", alias={"disable"})
     async def disable_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用管理命令。")
             return
         args = self._command_args(event, {"禁用", "disable"})
         yield event.plain_result(self._disable_group(event, args[0] if args else "当前群"))
@@ -357,7 +367,6 @@ class WelcomeCustomizationPlugin(Star):
     @filter.command("模式", alias={"mode"})
     async def mode_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用管理命令。")
             return
         args = self._command_args(event, {"模式", "mode"})
         if not args:
@@ -368,7 +377,6 @@ class WelcomeCustomizationPlugin(Star):
     @filter.command("卡片", alias={"card"})
     async def card_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用管理命令。")
             return
         args = self._command_args(event, {"卡片", "card"})
         yield event.plain_result(await self._card_command(event, args))
@@ -376,7 +384,6 @@ class WelcomeCustomizationPlugin(Star):
     @filter.command("记录", alias={"record", "forward"})
     async def record_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用管理命令。")
             return
         args = self._command_args(event, {"记录", "record", "forward"})
         yield event.plain_result(await self._record_command(event, args))
@@ -384,7 +391,6 @@ class WelcomeCustomizationPlugin(Star):
     @filter.command("图片", alias={"image", "img"})
     async def image_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用管理命令。")
             return
         args = self._command_args(event, {"图片", "image", "img"})
         yield event.plain_result(await self._image_command(event, args))
@@ -392,7 +398,6 @@ class WelcomeCustomizationPlugin(Star):
     @filter.command("管理员", alias={"admin"})
     async def admin_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用管理命令。")
             return
         args = self._command_args(event, {"管理员", "admin"})
         yield event.plain_result(self._admin_command(args))
@@ -400,7 +405,6 @@ class WelcomeCustomizationPlugin(Star):
     @filter.command("通知", alias={"notify"})
     async def notify_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用管理命令。")
             return
         args = self._command_args(event, {"通知", "notify"})
         yield event.plain_result(self._toggle_command("notify_admin_private", args))
@@ -408,7 +412,6 @@ class WelcomeCustomizationPlugin(Star):
     @filter.command("群内兜底", alias={"fallback", "group_fallback"})
     async def group_fallback_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            yield event.plain_result("没有权限使用管理命令。")
             return
         args = self._command_args(event, {"群内兜底", "fallback", "group_fallback"})
         yield event.plain_result(self._toggle_command("group_fallback_enabled", args))
@@ -431,7 +434,7 @@ class WelcomeCustomizationPlugin(Star):
     def _is_operator(self, event: AstrMessageEvent) -> bool:
         sender = str(event.get_sender_id())
         admins = set(self.store["settings"].get("admin_qq_list", []))
-        return not admins or sender in admins or event.is_admin()
+        return sender in admins or event.is_admin()
 
     @staticmethod
     def _is_group_increase(raw: Any) -> bool:
@@ -500,6 +503,11 @@ class WelcomeCustomizationPlugin(Star):
         )
 
         if ok:
+            if (
+                self.store["settings"].get("group_fallback_enabled")
+                and self.store["settings"].get("group_fallback_mode") == "on_join"
+            ):
+                await self._send_group_fallback(bot, group_id, user_id, routing)
             if self.store["settings"].get("notify_on_success"):
                 await self._notify_admins(
                     bot,
@@ -664,7 +672,7 @@ class WelcomeCustomizationPlugin(Star):
 
         if settings.get("group_fallback_enabled"):
             mode = settings.get("group_fallback_mode", "all_failed")
-            should_send = mode == "any_failed" or len(failed_steps) >= len(
+            should_send = mode in {"any_failed", "on_join"} or len(failed_steps) >= len(
                 settings.get("send_order", []),
             )
             if should_send:
@@ -1284,6 +1292,9 @@ class WelcomeCustomizationPlugin(Star):
                 "logs": list(reversed(self.store.get("logs", [])[-100:])),
                 "queue_size": self.queue.qsize(),
                 "worker_running": bool(self.worker_task and not self.worker_task.done()),
+                "astrbot": {
+                    "max_agent_step": self._get_max_agent_step(),
+                },
             },
         )
 
@@ -1394,6 +1405,38 @@ class WelcomeCustomizationPlugin(Star):
         self.store["settings"]["active_image_id"] = image_id
         self._save()
         return json_response({"image": item})
+
+    async def api_clear_logs(self):
+        self.store["logs"] = []
+        self._save()
+        return json_response({"cleared": True})
+
+    async def api_save_max_agent_step(self):
+        payload = await request.json(default={})
+        value = self._bounded_int(payload.get("max_agent_step"), 1, 200, 30)
+        cfg = self.context.get_config()
+        try:
+            provider_settings = dict(cfg.get("provider_settings", {}) or {})
+            provider_settings["max_agent_step"] = value
+            cfg["provider_settings"] = provider_settings
+        except Exception:
+            return error_response("current AstrBot config cannot be updated", status_code=500)
+        save_config = getattr(cfg, "save_config", None)
+        if not callable(save_config):
+            return error_response("current AstrBot config cannot be saved", status_code=500)
+        try:
+            save_config()
+        except Exception:
+            logger.exception("AstrBot 工具调用轮数上限保存失败。")
+            return error_response("current AstrBot config save failed", status_code=500)
+        return json_response({"saved": True, "max_agent_step": value})
+
+    def _get_max_agent_step(self) -> int:
+        try:
+            cfg = self.context.get_config()
+            return int(cfg.get("provider_settings", {}).get("max_agent_step", 30))
+        except Exception:
+            return 30
 
     def _get_aiocqhttp_bot(self) -> Any | None:
         get_platform = getattr(self.context, "get_platform", None)
