@@ -67,6 +67,10 @@ function render() {
   setValue("retryEnabled", settings.retry_enabled);
   setValue("retryCount", settings.retry_count);
   setValue("retryInterval", settings.retry_interval_seconds);
+  setValue("deliveryCompensationEnabled", settings.delivery_compensation_enabled);
+  setValue("deliveryConfirmWait", settings.delivery_confirm_wait_seconds);
+  setValue("deliveryCompensationCount", settings.delivery_compensation_count);
+  setValue("deliveryCompensationInterval", settings.delivery_compensation_interval_seconds);
   setValue("dedupeEnabled", settings.dedupe_enabled);
   setValue("dedupeMinutes", settings.dedupe_minutes);
   setValue("cardFallbackEnabled", settings.card_fallback_enabled);
@@ -123,6 +127,10 @@ function readSettings() {
     retry_enabled: $("retryEnabled").checked,
     retry_count: Number($("retryCount").value),
     retry_interval_seconds: Number($("retryInterval").value),
+    delivery_compensation_enabled: $("deliveryCompensationEnabled").checked,
+    delivery_confirm_wait_seconds: Number($("deliveryConfirmWait").value),
+    delivery_compensation_count: Number($("deliveryCompensationCount").value),
+    delivery_compensation_interval_seconds: Number($("deliveryCompensationInterval").value),
     dedupe_enabled: $("dedupeEnabled").checked,
     dedupe_minutes: Number($("dedupeMinutes").value),
     card_fallback_enabled: $("cardFallbackEnabled").checked,

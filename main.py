@@ -34,6 +34,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "retry_enabled": True,
     "retry_count": 1,
     "retry_interval_seconds": 5.0,
+    "delivery_compensation_enabled": True,
+    "delivery_confirm_wait_seconds": 8.0,
+    "delivery_compensation_count": 1,
+    "delivery_compensation_interval_seconds": 15.0,
     "dedupe_enabled": True,
     "dedupe_minutes": 1440,
     "notify_admin_private": False,
@@ -223,6 +227,24 @@ class WelcomeCustomizationPlugin(Star):
             0,
             600,
             5,
+        )
+        normalized["delivery_confirm_wait_seconds"] = self._bounded_float(
+            normalized.get("delivery_confirm_wait_seconds"),
+            1,
+            120,
+            8,
+        )
+        normalized["delivery_compensation_count"] = self._bounded_int(
+            normalized.get("delivery_compensation_count"),
+            0,
+            2,
+            1,
+        )
+        normalized["delivery_compensation_interval_seconds"] = self._bounded_float(
+            normalized.get("delivery_compensation_interval_seconds"),
+            1,
+            600,
+            15,
         )
         normalized["dedupe_minutes"] = self._bounded_int(
             normalized.get("dedupe_minutes"),
@@ -501,7 +523,7 @@ class WelcomeCustomizationPlugin(Star):
             "success" if ok else "failed",
             group_id,
             user_id,
-            ",".join(item["step"] for item in failed_steps) or "all",
+            self._summarize_step_results(step_results, failed_steps),
             "" if ok else "；".join(item["error"] for item in failed_steps),
             step_results,
         )
@@ -543,6 +565,7 @@ class WelcomeCustomizationPlugin(Star):
         last_error = ""
         use_missing_fallback = False
         fallback_text = ""
+        markers: list[dict[str, Any]] = []
         if step not in SEND_STEPS:
             return {
                 "step": step,
@@ -561,21 +584,41 @@ class WelcomeCustomizationPlugin(Star):
                     "skipped": True,
                 }
             use_missing_fallback = True
+            markers = [{"type": "text", "text": fallback_text}]
+        else:
+            markers = self._delivery_markers(step)
+        started_at = int(time.time())
         for index in range(attempts):
             try:
-                if use_missing_fallback:
-                    await self._send_private_payload(
-                        bot,
-                        user_id,
-                        [{"type": "text", "data": {"text": fallback_text}}],
-                        routing,
-                        origin_group_id,
-                    )
-                else:
-                    await self._send_step(bot, user_id, step, routing, origin_group_id)
+                await self._send_step_or_fallback(
+                    bot,
+                    user_id,
+                    step,
+                    routing,
+                    origin_group_id,
+                    use_missing_fallback,
+                    fallback_text,
+                )
                 return {"step": step, "ok": True, "attempts": index + 1, "error": ""}
             except Exception as e:
                 last_error = str(e)
+                if (
+                    self.store["settings"].get("delivery_compensation_enabled", True)
+                    and self._is_ambiguous_send_timeout(e)
+                ):
+                    return await self._handle_ambiguous_timeout(
+                        bot,
+                        user_id,
+                        step,
+                        routing,
+                        origin_group_id,
+                        use_missing_fallback,
+                        fallback_text,
+                        markers,
+                        started_at,
+                        index + 1,
+                        last_error,
+                    )
                 if index + 1 < attempts:
                     await asyncio.sleep(
                         float(self.store["settings"].get("retry_interval_seconds", 5)),
@@ -585,6 +628,109 @@ class WelcomeCustomizationPlugin(Star):
             "ok": False,
             "attempts": attempts,
             "error": f"{step}: {last_error}",
+            "fallback": use_missing_fallback,
+        }
+
+    async def _send_step_or_fallback(
+        self,
+        bot: Any,
+        user_id: str,
+        step: str,
+        routing: dict[str, Any],
+        origin_group_id: str | None,
+        use_missing_fallback: bool,
+        fallback_text: str,
+    ) -> None:
+        if use_missing_fallback:
+            await self._send_private_payload(
+                bot,
+                user_id,
+                [{"type": "text", "data": {"text": fallback_text}}],
+                routing,
+                origin_group_id,
+            )
+            return
+        await self._send_step(bot, user_id, step, routing, origin_group_id)
+
+    async def _handle_ambiguous_timeout(
+        self,
+        bot: Any,
+        user_id: str,
+        step: str,
+        routing: dict[str, Any],
+        origin_group_id: str | None,
+        use_missing_fallback: bool,
+        fallback_text: str,
+        markers: list[dict[str, Any]],
+        started_at: int,
+        attempts_done: int,
+        last_error: str,
+    ) -> dict[str, Any]:
+        settings = self.store["settings"]
+        wait_seconds = float(settings.get("delivery_confirm_wait_seconds", 8))
+        await asyncio.sleep(wait_seconds)
+        if await self._confirm_recent_private_delivery(
+            bot,
+            user_id,
+            markers,
+            started_at,
+        ):
+            return {
+                "step": step,
+                "ok": True,
+                "attempts": attempts_done,
+                "error": "",
+                "verified": True,
+                "ambiguous_timeout": True,
+            }
+
+        compensation_count = int(settings.get("delivery_compensation_count", 1))
+        interval = float(settings.get("delivery_compensation_interval_seconds", 15))
+        for offset in range(compensation_count):
+            await asyncio.sleep(interval)
+            try:
+                await self._send_step_or_fallback(
+                    bot,
+                    user_id,
+                    step,
+                    routing,
+                    origin_group_id,
+                    use_missing_fallback,
+                    fallback_text,
+                )
+                return {
+                    "step": step,
+                    "ok": True,
+                    "attempts": attempts_done + offset + 1,
+                    "error": "",
+                    "compensated": True,
+                    "ambiguous_timeout": True,
+                }
+            except Exception as e:
+                last_error = str(e)
+                if self._is_ambiguous_send_timeout(e):
+                    await asyncio.sleep(wait_seconds)
+                    if await self._confirm_recent_private_delivery(
+                        bot,
+                        user_id,
+                        markers,
+                        started_at,
+                    ):
+                        return {
+                            "step": step,
+                            "ok": True,
+                            "attempts": attempts_done + offset + 1,
+                            "error": "",
+                            "verified": True,
+                            "ambiguous_timeout": True,
+                        }
+        return {
+            "step": step,
+            "ok": False,
+            "attempts": attempts_done + compensation_count,
+            "error": f"{step}: {last_error}",
+            "ambiguous_timeout": True,
+            "compensation_exhausted": True,
             "fallback": use_missing_fallback,
         }
 
@@ -639,18 +785,24 @@ class WelcomeCustomizationPlugin(Star):
             segments = self._text_segments()
             if not segments:
                 raise ValueError("未配置文字内容")
+            errors = []
             for index, text in enumerate(segments):
-                await self._send_private_payload(
-                    bot,
-                    user_id,
-                    [{"type": "text", "data": {"text": text}}],
-                    routing,
-                    origin_group_id,
-                )
+                try:
+                    await self._send_private_payload(
+                        bot,
+                        user_id,
+                        [{"type": "text", "data": {"text": text}}],
+                        routing,
+                        origin_group_id,
+                    )
+                except Exception as e:
+                    errors.append(str(e))
                 if index + 1 < len(segments):
                     await asyncio.sleep(
                         float(self.store["settings"].get("send_interval_seconds", 1.5)),
                     )
+            if errors:
+                raise RuntimeError("；".join(errors))
             return
         raise ValueError(f"未知发送步骤：{step}")
 
@@ -687,6 +839,152 @@ class WelcomeCustomizationPlugin(Star):
             for item in str(self.store["settings"].get("text_content", "")).splitlines()
             if item.strip()
         ]
+
+    def _delivery_markers(self, step: str) -> list[dict[str, Any]]:
+        if step == "card":
+            return [{"type": "json"}]
+        if step == "record":
+            return [{"type": "forward"}]
+        if step == "image":
+            return [{"type": "image"}]
+        if step == "text":
+            return [{"type": "text", "text": item} for item in self._text_segments()]
+        return []
+
+    @staticmethod
+    def _is_ambiguous_send_timeout(error: Exception) -> bool:
+        text = str(error)
+        compact = re.sub(r"\s+", "", text)
+        return (
+            "Timeout: NTEvent" in text
+            and "NodeIKernelMsgService/sendMsg" in text
+            and '"result":0' in compact
+            and '"errMsg":""' in compact
+        )
+
+    async def _confirm_recent_private_delivery(
+        self,
+        bot: Any,
+        user_id: str,
+        markers: list[dict[str, Any]],
+        started_at: int,
+    ) -> bool:
+        if not markers:
+            return False
+        for action, params in self._history_probe_actions(user_id):
+            try:
+                data = await bot.call_action(action, **params)
+            except Exception:
+                continue
+            messages = self._extract_history_messages(data)
+            if self._history_contains_markers(messages, markers, started_at):
+                return True
+        return False
+
+    @staticmethod
+    def _history_probe_actions(user_id: str) -> list[tuple[str, dict[str, Any]]]:
+        uid = int(user_id)
+        return [
+            ("get_friend_msg_history", {"user_id": uid, "count": 30}),
+            ("get_private_msg_history", {"user_id": uid, "count": 30}),
+            ("get_msg_history", {"message_type": "private", "user_id": uid, "count": 30}),
+        ]
+
+    def _extract_history_messages(self, data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if not isinstance(data, dict):
+            return []
+        for key in ("messages", "msgs", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = self._extract_history_messages(value)
+                if nested:
+                    return nested
+        return [data] if "message" in data or "raw_message" in data else []
+
+    def _history_contains_markers(
+        self,
+        messages: list[dict[str, Any]],
+        markers: list[dict[str, Any]],
+        started_at: int,
+    ) -> bool:
+        if not messages:
+            return False
+        recent = []
+        for message in messages:
+            timestamp = self._message_timestamp(message)
+            if timestamp and timestamp < started_at - 3:
+                continue
+            recent.append(message)
+        return all(
+            any(self._message_matches_marker(message, marker) for message in recent)
+            for marker in markers
+        )
+
+    @staticmethod
+    def _message_timestamp(message: dict[str, Any]) -> int:
+        for key in ("time", "timestamp", "message_time"):
+            try:
+                value = int(message.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value:
+                return value
+        return 0
+
+    def _message_matches_marker(
+        self,
+        message: dict[str, Any],
+        marker: dict[str, Any],
+    ) -> bool:
+        raw = str(message.get("raw_message") or "")
+        segments = self._coerce_message_segments(message.get("message"))
+        marker_type = marker.get("type")
+        if marker_type == "text":
+            text = str(marker.get("text") or "")
+            if text and text in raw:
+                return True
+            return any(
+                segment.get("type") == "text"
+                and text in str((segment.get("data") or {}).get("text") or "")
+                for segment in segments
+            )
+        return any(segment.get("type") == marker_type for segment in segments) or (
+            marker_type and f"[{marker_type}]" in raw.lower()
+        )
+
+    @staticmethod
+    def _coerce_message_segments(value: Any) -> list[dict[str, Any]]:
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            return [value]
+        if isinstance(value, str) and value:
+            return [{"type": "text", "data": {"text": value}}]
+        return []
+
+    @staticmethod
+    def _summarize_step_results(
+        results: list[dict[str, Any]],
+        failed_steps: list[dict[str, Any]],
+    ) -> str:
+        notes = []
+        for item in results:
+            step = item.get("step", "unknown")
+            if item.get("skipped"):
+                notes.append(f"{step}:跳过")
+            elif item.get("verified"):
+                notes.append(f"{step}:复核成功")
+            elif item.get("compensated"):
+                notes.append(f"{step}:补偿发送")
+            elif item.get("ambiguous_timeout") and item.get("ok"):
+                notes.append(f"{step}:疑似送达")
+        if notes:
+            return ",".join(notes)
+        return ",".join(item["step"] for item in failed_steps) or "all"
 
     async def _send_private_payload(
         self,

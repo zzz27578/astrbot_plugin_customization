@@ -186,6 +186,29 @@
           </section>
 
           <section class="block full">
+            <h2>送达复核与补偿</h2>
+            <label class="check">
+              <input id="deliveryCompensationEnabled" type="checkbox" />
+              NTEvent 超时后复核并有限补发
+            </label>
+            <div class="inline-grid">
+              <label>
+                复核等待（秒）
+                <input id="deliveryConfirmWait" type="number" min="1" max="120" step="1" />
+              </label>
+              <label>
+                补发次数
+                <input id="deliveryCompensationCount" type="number" min="0" max="2" />
+              </label>
+              <label>
+                补发间隔（秒）
+                <input id="deliveryCompensationInterval" type="number" min="1" max="600" step="1" />
+              </label>
+            </div>
+            <p class="muted">仅处理 NapCat 的 NTEvent 空错误超时。插件会先尝试扫描最近私聊历史，确认不到才少量补发。</p>
+          </section>
+
+          <section class="block full">
             <h2>核心稳定性</h2>
             <label>
               AstrBot 工具调用轮数上限
