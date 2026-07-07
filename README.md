@@ -43,6 +43,16 @@ git clone https://github.com/zzz27578/astrbot_plugin_customization.git
 
 所有指令以 `/欢迎` 开头。是否需要 `/` 取决于你的 AstrBot 唤醒前缀配置。
 
+插件同时注册了 AstrBot 标准命令 `欢迎` / `welcome`，也内置了一个兜底解析入口。一般直接发送下面任一形式都可以：
+
+```text
+/欢迎 状态
+欢迎 状态
+/welcome status
+```
+
+如果 AstrBot 的唤醒前缀配置导致标准命令没有触发，兜底入口仍会尝试处理 `/欢迎`、`欢迎`、`/welcome`、`welcome` 开头的消息。
+
 ### 状态与测试
 
 ```text
@@ -134,6 +144,8 @@ git clone https://github.com/zzz27578/astrbot_plugin_customization.git
 ## 稳定性与兜底
 
 主链路会把新人入群事件放入发送队列，按顺序私聊三条消息，避免并发发送导致风控风险。
+
+新人入群依赖 NapCat/Lagrange 等 OneBot 协议端向 AstrBot 上报 `notice_type=group_increase` 事件。如果页面日志没有任何入群记录，请先检查协议端是否开启/正常上报 notice 事件，而不是先检查命令。
 
 可选兜底包括：
 

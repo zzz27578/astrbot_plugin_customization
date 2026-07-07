@@ -279,8 +279,27 @@ class WelcomeCustomizationPlugin(Star):
             finally:
                 self.queue.task_done()
 
-    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def on_any_event(self, event: AstrMessageEvent):
+        manual_args = self._manual_command_args(event)
+        if manual_args is not None:
+            if not self._is_operator(event):
+                event.stop_event()
+                yield event.plain_result("没有权限使用欢迎私聊管理命令。")
+                return
+            if not manual_args or manual_args[0] in {"帮助", "help", "?"}:
+                event.stop_event()
+                yield event.plain_result(self._help_text())
+                return
+            try:
+                text = await self._dispatch_command(event, manual_args)
+            except Exception as e:
+                logger.exception("欢迎私聊命令执行失败。")
+                text = f"执行失败：{e}"
+            event.stop_event()
+            yield event.plain_result(text)
+            return
+
         raw = getattr(event.message_obj, "raw_message", None)
         if not self._is_group_increase(raw):
             return
@@ -321,21 +340,23 @@ class WelcomeCustomizationPlugin(Star):
     @filter.command("欢迎", alias={"welcome"})
     async def welcome_command(self, event: AstrMessageEvent):
         if not self._is_operator(event):
-            return event.plain_result("没有权限使用欢迎私聊管理命令。")
+            yield event.plain_result("没有权限使用欢迎私聊管理命令。")
+            return
 
         args = self._command_args(event)
         if not args or args[0] in {"帮助", "help", "?"}:
-            return event.plain_result(self._help_text())
+            yield event.plain_result(self._help_text())
+            return
 
         try:
             text = await self._dispatch_command(event, args)
         except Exception as e:
             logger.exception("欢迎私聊命令执行失败。")
             text = f"执行失败：{e}"
-        return event.plain_result(text)
+        yield event.plain_result(text)
 
     async def _dispatch_command(self, event: AstrMessageEvent, args: list[str]) -> str:
-        cmd = args[0]
+        cmd = self._normalize_command_word(args[0])
         if cmd == "状态":
             return self._status_text()
         if cmd == "测试":
@@ -361,20 +382,55 @@ class WelcomeCustomizationPlugin(Star):
             return self._toggle_command("group_fallback_enabled", args[1:])
         return "未知命令。发送 /欢迎 帮助 查看内置指令。"
 
+    def _manual_command_args(self, event: AstrMessageEvent) -> list[str] | None:
+        text = re.sub(r"\s+", " ", event.get_message_str().strip())
+        if not text:
+            return None
+        for prefix in ("/欢迎", "！欢迎", "!欢迎", ".欢迎", "。欢迎", "欢迎", "/welcome", "!welcome", ".welcome", "welcome"):
+            if text == prefix:
+                return []
+            if text.startswith(prefix + " "):
+                return self._split_args(text[len(prefix) :].strip())
+        return None
+
     def _command_args(self, event: AstrMessageEvent) -> list[str]:
         text = re.sub(r"\s+", " ", event.get_message_str().strip())
-        text = re.sub(r"^[/!！。.]?欢迎\b", "", text, count=1).strip()
+        text = re.sub(r"^[/!！。.]?(欢迎|welcome)\b", "", text, count=1).strip()
         if not text:
             return []
+        return self._split_args(text)
+
+    @staticmethod
+    def _split_args(text: str) -> list[str]:
         try:
             return shlex.split(text)
         except ValueError:
             return text.split()
 
+    @staticmethod
+    def _normalize_command_word(word: str) -> str:
+        aliases = {
+            "status": "状态",
+            "test": "测试",
+            "enable": "启用",
+            "disable": "禁用",
+            "mode": "模式",
+            "card": "卡片",
+            "record": "记录",
+            "forward": "记录",
+            "image": "图片",
+            "img": "图片",
+            "admin": "管理员",
+            "notify": "通知",
+            "group_fallback": "群内兜底",
+            "fallback": "群内兜底",
+        }
+        return aliases.get(word.lower(), word)
+
     def _is_operator(self, event: AstrMessageEvent) -> bool:
         sender = str(event.get_sender_id())
         admins = set(self.store["settings"].get("admin_qq_list", []))
-        return sender in admins or event.is_admin()
+        return not admins or sender in admins or event.is_admin()
 
     @staticmethod
     def _is_group_increase(raw: Any) -> bool:
@@ -677,7 +733,7 @@ class WelcomeCustomizationPlugin(Star):
     async def _card_command(self, event: AstrMessageEvent, args: list[str]) -> str:
         if not args:
             return "用法：/欢迎 卡片 添加 名称；/欢迎 卡片 使用 名称；/欢迎 卡片 列表；/欢迎 卡片 删除 名称"
-        action = args[0]
+        action = self._normalize_action_word(args[0])
         if action == "添加":
             name = args[1] if len(args) > 1 else f"卡片{len(self.store['cards']) + 1}"
             raw_json = await self._extract_card_json(event)
@@ -700,7 +756,7 @@ class WelcomeCustomizationPlugin(Star):
     async def _record_command(self, event: AstrMessageEvent, args: list[str]) -> str:
         if not args:
             return "用法：/欢迎 记录 添加 名称；/欢迎 记录 使用 名称；/欢迎 记录 列表；/欢迎 记录 删除 名称"
-        action = args[0]
+        action = self._normalize_action_word(args[0])
         if action == "添加":
             name = args[1] if len(args) > 1 else f"聊天记录{len(self.store['records']) + 1}"
             node = await self._extract_record_node(event)
@@ -725,7 +781,7 @@ class WelcomeCustomizationPlugin(Star):
     async def _image_command(self, event: AstrMessageEvent, args: list[str]) -> str:
         if not args:
             return "用法：/欢迎 图片 添加 名称；/欢迎 图片 使用 名称；/欢迎 图片 列表；/欢迎 图片 删除 名称"
-        action = args[0]
+        action = self._normalize_action_word(args[0])
         if action == "添加":
             name = args[1] if len(args) > 1 else f"图片{len(self.store['images']) + 1}"
             source = await self._extract_image_source(event)
@@ -751,7 +807,7 @@ class WelcomeCustomizationPlugin(Star):
         label: str,
         args: list[str],
     ) -> str:
-        action = args[0]
+        action = self._normalize_action_word(args[0])
         if action == "列表":
             items = self.store.get(collection, {})
             if not items:
@@ -825,6 +881,8 @@ class WelcomeCustomizationPlugin(Star):
         return f"已切换启用模式：{mode}"
 
     def _admin_command(self, args: list[str]) -> str:
+        if args:
+            args[0] = self._normalize_action_word(args[0])
         if len(args) < 2 or args[0] not in {"添加", "删除"}:
             return "用法：/欢迎 管理员 添加 QQ；/欢迎 管理员 删除 QQ"
         admins = self.store["settings"]["admin_qq_list"]
@@ -837,12 +895,27 @@ class WelcomeCustomizationPlugin(Star):
         return f"管理员 QQ 列表：{', '.join(admins) or '空'}"
 
     def _toggle_command(self, key: str, args: list[str]) -> str:
-        if not args or args[0] not in {"开", "关", "on", "off"}:
+        if not args or args[0] not in {"开", "关", "on", "off", "true", "false"}:
             return "用法：开 / 关"
-        value = args[0] in {"开", "on"}
+        value = args[0] in {"开", "on", "true"}
         self.store["settings"][key] = value
         self._save()
         return f"{key} 已{'开启' if value else '关闭'}。"
+
+    @staticmethod
+    def _normalize_action_word(word: str) -> str:
+        aliases = {
+            "add": "添加",
+            "set": "添加",
+            "use": "使用",
+            "select": "使用",
+            "list": "列表",
+            "ls": "列表",
+            "delete": "删除",
+            "del": "删除",
+            "remove": "删除",
+        }
+        return aliases.get(word.lower(), word)
 
     async def _test_send(self, event: AstrMessageEvent, target: str) -> str:
         if not target:
@@ -1204,6 +1277,16 @@ class WelcomeCustomizationPlugin(Star):
         return json_response({"image": item})
 
     def _get_aiocqhttp_bot(self) -> Any | None:
+        get_platform = getattr(self.context, "get_platform", None)
+        if callable(get_platform):
+            try:
+                platform = get_platform(filter.PlatformAdapterType.AIOCQHTTP)
+                get_client = getattr(platform, "get_client", None)
+                if callable(get_client):
+                    return get_client()
+            except Exception:
+                pass
+
         platform_manager = getattr(self.context, "platform_manager", None)
         platforms = getattr(platform_manager, "platform_insts", []) or []
         for platform in platforms:
