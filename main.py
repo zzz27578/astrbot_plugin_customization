@@ -14,7 +14,7 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Face, Image, Json, Plain, Reply
+from astrbot.api.message_components import At, Face, Forward, Image, Json, Plain, Reply
 from astrbot.api.star import Context, Star
 from astrbot.api.web import PluginUploadFile, error_response, json_response, request
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -478,7 +478,13 @@ class WelcomeCustomizationPlugin(Star):
         step_results: list[dict[str, Any]] = []
 
         for step in self.store["settings"].get("send_order", []):
-            result = await self._send_step_with_retry(bot, user_id, step, routing)
+            result = await self._send_step_with_retry(
+                bot,
+                user_id,
+                step,
+                routing,
+                origin_group_id=group_id,
+            )
             step_results.append(result)
             await asyncio.sleep(float(self.store["settings"]["send_interval_seconds"]))
 
@@ -510,6 +516,7 @@ class WelcomeCustomizationPlugin(Star):
         user_id: str,
         step: str,
         routing: dict[str, Any],
+        origin_group_id: str | None = None,
     ) -> dict[str, Any]:
         attempts = 1
         if self.store["settings"].get("retry_enabled", True):
@@ -517,7 +524,7 @@ class WelcomeCustomizationPlugin(Star):
         last_error = ""
         for index in range(attempts):
             try:
-                await self._send_step(bot, user_id, step, routing)
+                await self._send_step(bot, user_id, step, routing, origin_group_id)
                 return {"step": step, "ok": True, "attempts": index + 1, "error": ""}
             except Exception as e:
                 last_error = str(e)
@@ -538,6 +545,7 @@ class WelcomeCustomizationPlugin(Star):
         user_id: str,
         step: str,
         routing: dict[str, Any],
+        origin_group_id: str | None = None,
     ) -> None:
         if step == "card":
             card = self._active_item("cards", "active_card_id")
@@ -548,20 +556,23 @@ class WelcomeCustomizationPlugin(Star):
                 user_id,
                 [{"type": "json", "data": {"data": card["raw_json"]}}],
                 routing,
+                origin_group_id,
             )
             return
         if step == "record":
             record = self._active_item("records", "active_record_id")
             if not record or not record.get("nodes"):
                 raise ValueError("未设置启用聊天记录")
-            await bot.call_action(
-                "send_private_forward_msg",
-                user_id=int(user_id),
-                messages=[
+            params = {
+                "user_id": int(user_id),
+                "messages": [
                     {"type": "node", "data": node} for node in record.get("nodes", [])
                 ],
                 **routing,
-            )
+            }
+            if origin_group_id:
+                params["group_id"] = int(origin_group_id)
+            await bot.call_action("send_private_forward_msg", **params)
             return
         if step == "image":
             image = self._active_item("images", "active_image_id")
@@ -572,6 +583,7 @@ class WelcomeCustomizationPlugin(Star):
                 user_id,
                 [{"type": "image", "data": {"file": self._image_payload(image)}}],
                 routing,
+                origin_group_id,
             )
             return
         raise ValueError(f"未知发送步骤：{step}")
@@ -582,13 +594,16 @@ class WelcomeCustomizationPlugin(Star):
         user_id: str,
         payload: list[dict[str, Any]],
         routing: dict[str, Any],
+        origin_group_id: str | None = None,
     ) -> None:
-        await bot.call_action(
-            "send_private_msg",
-            user_id=int(user_id),
-            message=payload,
+        params = {
+            "user_id": int(user_id),
+            "message": payload,
             **routing,
-        )
+        }
+        if origin_group_id:
+            params["group_id"] = int(origin_group_id)
+        await bot.call_action("send_private_msg", **params)
 
     def _active_item(self, collection: str, active_key: str) -> dict[str, Any] | None:
         item_id = self.store["settings"].get(active_key)
@@ -632,6 +647,7 @@ class WelcomeCustomizationPlugin(Star):
                     user_id,
                     [{"type": "text", "data": {"text": text}}],
                     routing,
+                    group_id,
                 )
             except Exception:
                 logger.exception("欢迎私聊降级文本发送失败。")
@@ -760,8 +776,8 @@ class WelcomeCustomizationPlugin(Star):
         action = self._normalize_action_word(args[0])
         if action == "添加":
             name = args[1] if len(args) > 1 else f"聊天记录{len(self.store['records']) + 1}"
-            node = await self._extract_record_node(event)
-            if not node:
+            nodes = await self._extract_record_nodes(event)
+            if not nodes:
                 return "没有在引用消息中找到可保存的聊天记录内容。"
             record_id = self._find_material_id_by_name("records", name)
             if not record_id:
@@ -772,11 +788,11 @@ class WelcomeCustomizationPlugin(Star):
                     "nodes": [],
                     "created_at": int(time.time()),
                 }
-            self.store["records"][record_id]["nodes"].append(node)
+            self.store["records"][record_id]["nodes"].extend(nodes)
             self.store["records"][record_id]["updated_at"] = int(time.time())
             self.store["settings"]["active_record_id"] = record_id
             self._save()
-            return f"已保存聊天记录节点到模板：{name}"
+            return f"已保存 {len(nodes)} 个聊天记录节点到模板：{name}"
         return self._material_command("records", "active_record_id", "聊天记录", args)
 
     async def _image_command(self, event: AstrMessageEvent, args: list[str]) -> str:
@@ -1002,18 +1018,22 @@ class WelcomeCustomizationPlugin(Star):
                 return str(component.url or component.file or "")
         return ""
 
-    async def _extract_record_node(self, event: AstrMessageEvent) -> dict[str, Any] | None:
+    async def _extract_record_nodes(self, event: AstrMessageEvent) -> list[dict[str, Any]]:
         snapshot = await self._reply_snapshot(event)
         if not snapshot:
-            return None
+            return []
+        if snapshot.get("nodes"):
+            return snapshot["nodes"]
         content = snapshot.get("content", [])
         if not content:
-            return None
-        return {
-            "user_id": str(snapshot.get("user_id") or event.get_sender_id()),
-            "nickname": str(snapshot.get("nickname") or "QQ 用户"),
-            "content": content,
-        }
+            return []
+        return [
+            {
+                "user_id": str(snapshot.get("user_id") or event.get_sender_id()),
+                "nickname": str(snapshot.get("nickname") or "QQ 用户"),
+                "content": content,
+            },
+        ]
 
     async def _reply_snapshot(self, event: AstrMessageEvent) -> dict[str, Any] | None:
         raw = getattr(event.message_obj, "raw_message", None)
@@ -1026,6 +1046,15 @@ class WelcomeCustomizationPlugin(Star):
                         message_id=int(reply_id),
                         **({"self_id": raw.get("self_id")} if raw.get("self_id") else {}),
                     )
+                    forward_id = self._forward_id_from_raw(ret.get("message", []))
+                    if forward_id:
+                        nodes = await self._fetch_forward_nodes(
+                            event.bot,
+                            forward_id,
+                            {"self_id": raw.get("self_id")} if raw.get("self_id") else {},
+                        )
+                        if nodes:
+                            return {"nodes": nodes}
                     sender = ret.get("sender") or {}
                     return {
                         "user_id": sender.get("user_id") or ret.get("user_id"),
@@ -1040,6 +1069,18 @@ class WelcomeCustomizationPlugin(Star):
 
         for component in self._reply_chain(event, include_reply=True):
             if isinstance(component, Reply) and component.chain:
+                for seg in self._components_to_segments(component.chain):
+                    if seg.get("type") == "forward" and seg.get("data", {}).get("id"):
+                        try:
+                            nodes = await self._fetch_forward_nodes(
+                                event.bot,
+                                str(seg["data"]["id"]),
+                                {},
+                            )
+                            if nodes:
+                                return {"nodes": nodes}
+                        except Exception:
+                            logger.exception("读取引用合并转发消息失败。")
                 return {
                     "user_id": component.sender_id or component.qq,
                     "nickname": component.sender_nickname or str(component.sender_id),
@@ -1047,6 +1088,72 @@ class WelcomeCustomizationPlugin(Star):
                     "content": self._components_to_segments(component.chain),
                 }
         return None
+
+    async def _fetch_forward_nodes(
+        self,
+        bot: Any,
+        forward_id: str,
+        routing: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        ret = await bot.call_action("get_forward_msg", id=forward_id, **routing)
+        messages = self._extract_forward_messages(ret)
+        nodes: list[dict[str, Any]] = []
+        for item in messages:
+            node = self._forward_message_to_node(item)
+            if node:
+                nodes.append(node)
+        return nodes
+
+    @staticmethod
+    def _extract_forward_messages(ret: Any) -> list[Any]:
+        if isinstance(ret, list):
+            return ret
+        if not isinstance(ret, dict):
+            return []
+        for key in ("messages", "message", "data"):
+            value = ret.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = value.get("messages") or value.get("message")
+                if isinstance(nested, list):
+                    return nested
+        return []
+
+    def _forward_message_to_node(self, item: Any) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        if item.get("type") == "node" and isinstance(item.get("data"), dict):
+            return self._normalize_node_data(item["data"])
+
+        sender = item.get("sender") or {}
+        content = item.get("content", item.get("message", []))
+        node = {
+            "user_id": str(
+                item.get("user_id")
+                or item.get("uin")
+                or sender.get("user_id")
+                or sender.get("uin")
+                or "0",
+            ),
+            "nickname": str(
+                item.get("nickname")
+                or sender.get("card")
+                or sender.get("nickname")
+                or sender.get("name")
+                or "QQ 用户",
+            ),
+            "content": self._normalize_raw_segments(content),
+        }
+        return node if node["content"] else None
+
+    def _normalize_node_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        content = data.get("content", [])
+        return {
+            "user_id": str(data.get("user_id") or data.get("uin") or "0"),
+            "nickname": str(data.get("nickname") or data.get("name") or "QQ 用户"),
+            "content": self._normalize_raw_segments(content),
+        }
 
     async def _raw_reply_segments(self, event: AstrMessageEvent) -> list[dict[str, Any]]:
         snapshot = await self._reply_snapshot(event)
@@ -1058,6 +1165,15 @@ class WelcomeCustomizationPlugin(Star):
             return ""
         for segment in message:
             if segment.get("type") == "reply":
+                return str(segment.get("data", {}).get("id") or "")
+        return ""
+
+    @staticmethod
+    def _forward_id_from_raw(message: Any) -> str:
+        if not isinstance(message, list):
+            return ""
+        for segment in message:
+            if segment.get("type") == "forward":
                 return str(segment.get("data", {}).get("id") or "")
         return ""
 
@@ -1111,6 +1227,8 @@ class WelcomeCustomizationPlugin(Star):
                         "data": {"data": self._json_segment_to_raw(component.data)},
                     },
                 )
+            elif isinstance(component, Forward):
+                ret.append({"type": "forward", "data": {"id": str(component.id)}})
             elif isinstance(component, At):
                 ret.append({"type": "at", "data": {"qq": str(component.qq)}})
             elif isinstance(component, Face):

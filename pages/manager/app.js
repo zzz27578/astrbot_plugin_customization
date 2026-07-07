@@ -179,6 +179,10 @@ function renderMaterials(containerId, items, activeId, kind) {
           <button class="small danger" data-action="delete" data-kind="${kind}" data-id="${item.id}" type="button">删除</button>
         </div>
       </div>
+      <label class="rename-line">
+        名称
+        <input data-name-input value="${escapeHtml(item.name)}" />
+      </label>
       ${previewFor(item, kind)}
     `;
     root.appendChild(node);
@@ -263,22 +267,32 @@ document.body.addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
   const { action, kind, id } = button.dataset;
-  if (action === "activate") {
-    await bridge.apiPost("activate", { kind, id });
-    showToast(`${labels[kind]}已启用`);
+  button.disabled = true;
+  try {
+    if (action === "activate") {
+      await bridge.apiPost("activate", { kind, id });
+      showToast(`${labels[kind]}已启用`);
+    }
+    if (action === "rename") {
+      const input = button.closest(".item")?.querySelector("[data-name-input]");
+      const name = input?.value?.trim();
+      if (!name) {
+        showToast("名称不能为空");
+        return;
+      }
+      await bridge.apiPost("rename", { kind, id, name });
+      showToast(`${labels[kind]}已重命名`);
+    }
+    if (action === "delete") {
+      await bridge.apiPost("delete", { kind, id });
+      showToast(`${labels[kind]}已删除`);
+    }
+    await loadState();
+  } catch (error) {
+    showToast(error.message || "操作失败");
+  } finally {
+    button.disabled = false;
   }
-  if (action === "rename") {
-    const name = window.prompt("新名称");
-    if (!name) return;
-    await bridge.apiPost("rename", { kind, id, name });
-    showToast(`${labels[kind]}已重命名`);
-  }
-  if (action === "delete") {
-    if (!window.confirm(`删除这条${labels[kind]}？`)) return;
-    await bridge.apiPost("delete", { kind, id });
-    showToast(`${labels[kind]}已删除`);
-  }
-  await loadState();
 });
 
 $("imageUpload").addEventListener("change", async (event) => {

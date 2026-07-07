@@ -359,6 +359,18 @@ textarea {
   justify-content: flex-end;
 }
 
+.rename-line {
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: center;
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+.rename-line input {
+  min-height: 34px;
+  padding: 6px 8px;
+}
+
 .card-preview {
   border-radius: 8px;
   background: #ffffff;
@@ -402,13 +414,22 @@ textarea {
 }
 
 .order-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 48px;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+  gap: 14px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  padding: 8px 10px;
+  padding: 10px 12px;
+  min-height: 48px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.order-row input {
+  justify-self: end;
+  width: 20px;
+  min-height: 20px;
 }
 
 .logs {
