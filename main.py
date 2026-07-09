@@ -1144,6 +1144,7 @@ class WelcomeCustomizationPlugin(Star):
                     user_id,
                     source_message_id,
                     forward_routing,
+                    origin_group_id,
                 )
                 return
             raise RuntimeError("该聊天记录不是原始消息素材；请重新回复原始聊天记录执行 /记录 添加 名称")
@@ -1682,6 +1683,7 @@ class WelcomeCustomizationPlugin(Star):
         user_id: str,
         message_id: str,
         routing: dict[str, Any],
+        origin_group_id: str | None = None,
     ) -> None:
         wait_seconds = float(self.store["settings"].get("delivery_confirm_wait_seconds", 8))
         errors: list[str] = []
@@ -1708,6 +1710,92 @@ class WelcomeCustomizationPlugin(Star):
                 return
             errors.append(f"{action}: API 返回成功，但最近私聊历史未确认收到聊天记录")
         raise RuntimeError("; ".join(errors) or "原消息转发失败")
+
+    async def _send_original_node_to_temp_chat_confirmed(
+        self,
+        bot: Any,
+        user_id: str,
+        message_id: str,
+        routing: dict[str, Any],
+        origin_group_id: str,
+    ) -> None:
+        payload = {
+            "message_type": "private",
+            "sub_type": "group",
+            "user_id": int(user_id),
+            "group_id": int(origin_group_id),
+            "message": [{"type": "node", "data": {"id": message_id}}],
+            **routing,
+        }
+        wait_seconds = float(self.store["settings"].get("delivery_confirm_wait_seconds", 8))
+        errors: list[str] = []
+        for action in ("send_msg", "send_private_forward_msg", "send_forward_msg"):
+            params = dict(payload)
+            if action != "send_msg":
+                params["messages"] = params["message"]
+            started_at = int(time.time())
+            try:
+                await bot.call_action(action, **params)
+            except Exception as e:
+                errors.append(f"{action}: {e}")
+                continue
+            await asyncio.sleep(wait_seconds)
+            if await self._confirm_recent_private_delivery(
+                bot,
+                user_id,
+                [{"type": "forward"}],
+                started_at,
+                routing,
+            ):
+                return
+            errors.append(f"{action}: API 返回成功，但最近私聊历史未确认收到聊天记录")
+        raise RuntimeError("; ".join(errors) or "临时会话原消息节点发送失败")
+
+    async def _forward_single_message_to_user(
+        self,
+        bot: Any,
+        user_id: str,
+        message_id: str,
+        routing: dict[str, Any],
+        origin_group_id: str | None = None,
+    ) -> None:
+        wait_seconds = float(self.store["settings"].get("delivery_confirm_wait_seconds", 8))
+        errors: list[str] = []
+        for action in ("forward_friend_single_msg", "forward_group_single_msg"):
+            started_at = int(time.time())
+            try:
+                await bot.call_action(
+                    action,
+                    user_id=int(user_id),
+                    message_id=message_id,
+                    **routing,
+                )
+            except Exception as e:
+                errors.append(f"{action}: {e}")
+                continue
+            await asyncio.sleep(wait_seconds)
+            if await self._confirm_recent_private_delivery(
+                bot,
+                user_id,
+                [{"type": "forward"}],
+                started_at,
+                routing,
+            ):
+                return
+            errors.append(f"{action}: API returned success but private history did not confirm delivery")
+        if origin_group_id:
+            try:
+                await self._send_original_node_to_temp_chat_confirmed(
+                    bot,
+                    user_id,
+                    message_id,
+                    routing,
+                    origin_group_id,
+                )
+                return
+            except Exception as e:
+                errors.append(f"send_msg_temp_node: {e}")
+        raise RuntimeError("; ".join(errors) or "forward original message failed")
 
     async def _send_forward_id_private_confirmed(
         self,
@@ -1888,6 +1976,7 @@ class WelcomeCustomizationPlugin(Star):
                         user_id,
                         source_message_id,
                         routing,
+                        origin_group_id,
                     )
                 else:
                     await self._send_direct_record_by_strategy(
