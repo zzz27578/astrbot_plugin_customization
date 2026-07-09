@@ -22,6 +22,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 PLUGIN_NAME = "astrbot_plugin_customization"
 STORE_VERSION = 1
 SEND_STEPS = {"card", "record", "image", "text"}
+FORWARD_EXPAND_MAX_DEPTH = 6
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -758,11 +759,14 @@ class WelcomeCustomizationPlugin(Star):
             record = self._active_item("records", "active_record_id")
             if not record or not record.get("nodes"):
                 raise ValueError("未设置启用聊天记录")
+            nodes = await self._prepare_record_nodes_for_send(
+                bot,
+                record.get("nodes", []),
+                routing,
+            )
             params = {
                 "user_id": int(user_id),
-                "messages": [
-                    {"type": "node", "data": node} for node in record.get("nodes", [])
-                ],
+                "messages": [{"type": "node", "data": node} for node in nodes],
                 **routing,
             }
             if origin_group_id:
@@ -1506,15 +1510,115 @@ class WelcomeCustomizationPlugin(Star):
         bot: Any,
         forward_id: str,
         routing: dict[str, Any],
+        depth: int = 0,
+        seen: set[str] | None = None,
     ) -> list[dict[str, Any]]:
+        if depth >= FORWARD_EXPAND_MAX_DEPTH:
+            logger.warning("合并转发嵌套层级过深，停止展开：%s", forward_id)
+            return []
+        seen = set(seen or ())
+        if forward_id in seen:
+            logger.warning("合并转发出现循环引用，停止展开：%s", forward_id)
+            return []
+        seen.add(forward_id)
         ret = await bot.call_action("get_forward_msg", id=forward_id, **routing)
         messages = self._extract_forward_messages(ret)
         nodes: list[dict[str, Any]] = []
         for item in messages:
             node = self._forward_message_to_node(item)
-            if node:
-                nodes.append(node)
+            nodes.extend(
+                await self._expand_record_node(
+                    bot,
+                    node,
+                    routing,
+                    depth + 1,
+                    seen,
+                ),
+            )
         return nodes
+
+    async def _prepare_record_nodes_for_send(
+        self,
+        bot: Any,
+        nodes: list[dict[str, Any]],
+        routing: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        expanded: list[dict[str, Any]] = []
+        for node in nodes:
+            expanded.extend(
+                await self._expand_record_node(
+                    bot,
+                    deepcopy(node),
+                    routing,
+                    0,
+                    set(),
+                ),
+            )
+        if not expanded:
+            raise ValueError("聊天记录内容为空，或嵌套聊天记录无法展开")
+        return expanded
+
+    async def _expand_record_node(
+        self,
+        bot: Any,
+        node: dict[str, Any] | None,
+        routing: dict[str, Any],
+        depth: int,
+        seen: set[str],
+    ) -> list[dict[str, Any]]:
+        if not node:
+            return []
+        normalized = self._normalize_node_data(node)
+        content, nested_nodes = await self._expand_forward_segments(
+            bot,
+            normalized.get("content", []),
+            routing,
+            depth,
+            seen,
+        )
+        result: list[dict[str, Any]] = []
+        if content:
+            normalized["content"] = content
+            result.append(normalized)
+        result.extend(nested_nodes)
+        return result
+
+    async def _expand_forward_segments(
+        self,
+        bot: Any,
+        segments: list[dict[str, Any]],
+        routing: dict[str, Any],
+        depth: int,
+        seen: set[str],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        content: list[dict[str, Any]] = []
+        nested_nodes: list[dict[str, Any]] = []
+        for segment in self._normalize_raw_segments(segments):
+            forward_id = self._forward_id_from_segment(segment)
+            if not forward_id:
+                content.append(segment)
+                continue
+            try:
+                expanded = await self._fetch_forward_nodes(
+                    bot,
+                    forward_id,
+                    routing,
+                    depth,
+                    seen,
+                )
+            except Exception:
+                logger.exception("展开嵌套合并转发失败：%s", forward_id)
+                expanded = []
+            if expanded:
+                nested_nodes.extend(expanded)
+            else:
+                content.append(
+                    {
+                        "type": "text",
+                        "data": {"text": "[嵌套聊天记录暂时无法展开，请重新采集该素材]"},
+                    },
+                )
+        return content, nested_nodes
 
     @staticmethod
     def _extract_forward_messages(ret: Any) -> list[Any]:
@@ -1585,9 +1689,23 @@ class WelcomeCustomizationPlugin(Star):
         if not isinstance(message, list):
             return ""
         for segment in message:
-            if segment.get("type") == "forward":
-                return str(segment.get("data", {}).get("id") or "")
+            forward_id = WelcomeCustomizationPlugin._forward_id_from_segment(segment)
+            if forward_id:
+                return forward_id
         return ""
+
+    @staticmethod
+    def _forward_id_from_segment(segment: Any) -> str:
+        if not isinstance(segment, dict) or segment.get("type") != "forward":
+            return ""
+        data = segment.get("data") or {}
+        return str(
+            data.get("id")
+            or data.get("res_id")
+            or data.get("forward_id")
+            or data.get("file")
+            or "",
+        )
 
     @staticmethod
     def _reply_chain(
