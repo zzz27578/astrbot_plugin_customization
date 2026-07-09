@@ -381,6 +381,11 @@ class WelcomeCustomizationPlugin(Star):
         content: list[dict[str, Any]] = []
         extra_nodes: list[dict[str, Any]] = []
         for segment in self._normalize_raw_segments(segments):
+            forward_id = self._forward_id_from_segment(segment)
+            if forward_id:
+                content.append({"type": "forward", "data": {"id": forward_id}})
+                continue
+
             data = segment.get("data") if isinstance(segment, dict) else None
             nested_nodes = data.get("_nested_nodes") if isinstance(data, dict) else None
             if segment.get("type") == "forward" and isinstance(nested_nodes, list):
@@ -395,11 +400,6 @@ class WelcomeCustomizationPlugin(Star):
                             unresolved,
                         ),
                     )
-                continue
-
-            forward_id = self._forward_id_from_segment(segment)
-            if forward_id:
-                content.append({"type": "forward", "data": {"id": forward_id}})
                 continue
 
             embedded_nodes = self._embedded_forward_nodes_from_segment(segment)
@@ -1457,7 +1457,7 @@ class WelcomeCustomizationPlugin(Star):
                 direct_routing,
                 origin_group_id,
                 stop_on_success=True,
-                trusted_only=True,
+                trusted_only=False,
                 confirm_delivery=True,
             )
         except Exception as e:
@@ -1487,7 +1487,7 @@ class WelcomeCustomizationPlugin(Star):
                     direct_routing,
                     origin_group_id,
                     stop_on_success=True,
-                    trusted_only=True,
+                    trusted_only=False,
                     confirm_delivery=True,
                 )
             except Exception as e:
@@ -1748,17 +1748,17 @@ class WelcomeCustomizationPlugin(Star):
             raise ValueError("直转记录缺少原消息 message_id")
         source_group_id = str(record.get("source_group_id") or "").strip()
         source_forward_id = str(record.get("source_forward_id") or "").strip()
-        target_group_id = str(source_group_id or origin_group_id or "").strip()
+        delivery_group_id = str(origin_group_id or "").strip()
         preferred = str(record.get("last_strategy") or "").strip()
-        if target_group_id:
+        if source_group_id:
             strategies: list[str] = ["forward_group_single_msg"]
         else:
             strategies = ["forward_friend_single_msg"]
         if source_forward_id:
             strategies.append("forward_segment_private")
-        if target_group_id:
-            strategies.append("forward_node_id_private_without_group")
+        if delivery_group_id:
             strategies.append("forward_node_id_private")
+            strategies.append("forward_node_id_private_without_group")
         else:
             strategies.append("forward_node_id_private")
             strategies.append("forward_node_id_private_without_group")
@@ -1782,7 +1782,8 @@ class WelcomeCustomizationPlugin(Star):
                     user_id,
                     source_message_id,
                     source_forward_id,
-                    target_group_id,
+                    source_group_id,
+                    delivery_group_id,
                     routing,
                 )
                 if confirm_delivery:
@@ -1813,7 +1814,8 @@ class WelcomeCustomizationPlugin(Star):
         user_id: str,
         source_message_id: str,
         source_forward_id: str,
-        target_group_id: str,
+        source_group_id: str,
+        delivery_group_id: str,
         routing: dict[str, Any],
     ) -> None:
         if strategy == "forward_node_id_private":
@@ -1826,7 +1828,7 @@ class WelcomeCustomizationPlugin(Star):
             }
             await self._call_send_attempts(
                 bot,
-                self._private_forward_attempts(params, target_group_id or None),
+                self._private_forward_attempts(params, delivery_group_id or None),
             )
             return
         if strategy == "forward_node_id_private_without_group":
@@ -1846,11 +1848,11 @@ class WelcomeCustomizationPlugin(Star):
             )
             return
         if strategy == "forward_group_single_msg":
-            if not target_group_id:
+            if not source_group_id:
                 raise ValueError("群原消息直转缺少来源群号")
             await bot.call_action(
                 "forward_group_single_msg",
-                group_id=int(target_group_id),
+                group_id=int(source_group_id),
                 user_id=int(user_id),
                 message_id=source_message_id,
                 **routing,
@@ -1864,7 +1866,7 @@ class WelcomeCustomizationPlugin(Star):
                 user_id,
                 [{"type": "forward", "data": {"id": source_forward_id}}],
                 routing,
-                target_group_id or None,
+                delivery_group_id or None,
             )
             return
         raise ValueError(f"未知直转策略：{strategy}")
@@ -2601,7 +2603,7 @@ class WelcomeCustomizationPlugin(Star):
                 direct_routing,
                 str(event.get_group_id() or record.get("source_group_id") or ""),
                 stop_on_success=True,
-                trusted_only=True,
+                trusted_only=False,
                 confirm_delivery=True,
             )
         except Exception as e:
@@ -2864,67 +2866,11 @@ class WelcomeCustomizationPlugin(Star):
         content: list[dict[str, Any]] = []
         nested_nodes: list[dict[str, Any]] = []
         for segment in self._normalize_raw_segments(segments):
-            embedded_nodes = self._embedded_forward_nodes_from_segment(segment)
-            if embedded_nodes:
-                children: list[dict[str, Any]] = []
-                for node in embedded_nodes:
-                    child_node = self._forward_message_to_node(node)
-                    if child_node:
-                        self._attach_record_node_meta(
-                            child_node,
-                            current_forward_id or "embedded_forward_nodes",
-                            current_forward_id,
-                            depth + 1,
-                        )
-                    children.extend(
-                        await self._expand_record_node(
-                            bot,
-                            child_node,
-                            routing,
-                            depth + 1,
-                            seen,
-                            unresolved,
-                            current_forward_id,
-                        ),
-                    )
-                if children:
-                    content.append(
-                        {
-                            "type": "forward",
-                            "data": {
-                                "_nested_nodes": children,
-                                "_source_forward_id": current_forward_id
-                                or "embedded_forward_nodes",
-                            },
-                        },
-                    )
-                continue
             forward_id = self._forward_id_from_segment(segment)
-            if not forward_id:
-                content.append(segment)
+            if forward_id:
+                content.append({"type": "forward", "data": {"id": forward_id}})
                 continue
-            nested = await self._fetch_forward_nodes(
-                bot,
-                forward_id,
-                routing,
-                depth + 1,
-                seen,
-                unresolved,
-                current_forward_id,
-            )
-            if nested:
-                content.append(
-                    {
-                        "type": "forward",
-                        "data": {
-                            "id": forward_id,
-                            "_nested_nodes": nested,
-                            "_source_forward_id": forward_id,
-                        },
-                    },
-                )
-                continue
-            content.append({"type": "forward", "data": {"id": forward_id}})
+            content.append(segment)
         return content, nested_nodes
 
     @staticmethod
