@@ -346,11 +346,13 @@ class WelcomeCustomizationPlugin(Star):
         depth: int,
         seen: set[str],
         unresolved: list[str],
-    ) -> dict[str, Any] | None:
+    ) -> list[dict[str, Any]]:
         if not node:
-            return None
+            return []
         normalized = self._normalize_node_data(node)
-        normalized["content"] = await self._prepare_record_segments_for_send(
+        if isinstance(node.get("_record_meta"), dict):
+            normalized["_record_meta"] = dict(node["_record_meta"])
+        content = await self._prepare_record_segments_for_send(
             bot,
             normalized.get("content", []),
             routing,
@@ -358,7 +360,11 @@ class WelcomeCustomizationPlugin(Star):
             seen,
             unresolved,
         )
-        return normalized
+        result: list[dict[str, Any]] = []
+        if content:
+            normalized["content"] = content
+            result.append(normalized)
+        return result
 
     async def _prepare_record_segments_for_send(
         self,
@@ -373,11 +379,6 @@ class WelcomeCustomizationPlugin(Star):
         for segment in self._normalize_raw_segments(segments):
             data = segment.get("data") if isinstance(segment, dict) else None
             nested_nodes = data.get("_nested_nodes") if isinstance(data, dict) else None
-            forward_id = self._forward_id_from_segment(segment)
-            if segment.get("type") == "forward" and forward_id:
-                content.append({"type": "forward", "data": {"id": forward_id}})
-                continue
-
             if segment.get("type") == "forward" and isinstance(nested_nodes, list):
                 nested_segment = await self._nodes_to_nested_node_segment(
                     bot,
@@ -389,6 +390,23 @@ class WelcomeCustomizationPlugin(Star):
                 )
                 if nested_segment:
                     content.append(nested_segment)
+                continue
+
+            forward_id = self._forward_id_from_segment(segment)
+            if forward_id:
+                refreshed = await self._forward_segment_with_nested_backup(
+                    bot,
+                    forward_id,
+                    routing,
+                    depth,
+                    seen,
+                    unresolved,
+                )
+                if refreshed:
+                    content.append(refreshed)
+                    continue
+                if segment.get("type") in {"forward", "json"}:
+                    content.append(refreshed or {"type": "forward", "data": {"id": forward_id}})
                     continue
 
             content.append(self._strip_internal_segment_fields(segment))
@@ -405,16 +423,16 @@ class WelcomeCustomizationPlugin(Star):
     ) -> dict[str, Any] | None:
         prepared: list[dict[str, Any]] = []
         for node in nodes:
-            prepared_node = await self._prepare_record_node_for_send(
-                bot,
-                deepcopy(node),
-                routing,
-                depth,
-                seen,
-                unresolved,
+            prepared.extend(
+                await self._prepare_record_node_for_send(
+                    bot,
+                    deepcopy(node),
+                    routing,
+                    depth,
+                    seen,
+                    unresolved,
+                ),
             )
-            if prepared_node and prepared_node.get("content"):
-                prepared.append(prepared_node)
         if not prepared:
             return None
         return {
@@ -1275,11 +1293,7 @@ class WelcomeCustomizationPlugin(Star):
 
     @staticmethod
     def _trusted_direct_record_strategy(strategy: str) -> bool:
-        return strategy in {
-            "forward_segment_private",
-            "forward_node_id_private",
-            "forward_friend_single_msg",
-        }
+        return strategy in {"forward_friend_single_msg"}
 
     async def _send_direct_record(
         self,
@@ -1297,6 +1311,7 @@ class WelcomeCustomizationPlugin(Star):
                 routing,
                 origin_group_id,
                 stop_on_success=True,
+                trusted_only=True,
             )
         except Exception as e:
             attempts = [{"strategy": "direct_source", "ok": False, "error": str(e)}]
@@ -1325,6 +1340,7 @@ class WelcomeCustomizationPlugin(Star):
                     routing,
                     origin_group_id,
                     stop_on_success=True,
+                    trusted_only=True,
                 )
             except Exception as e:
                 retry_attempts = [{"strategy": "direct_source_retry", "ok": False, "error": str(e)}]
@@ -1476,7 +1492,6 @@ class WelcomeCustomizationPlugin(Star):
         group_id = int(origin_group_id)
         with_group = {**params, "group_id": group_id}
         return [
-            ("send_private_forward_msg", with_group),
             (
                 "send_forward_msg",
                 {
@@ -1486,6 +1501,7 @@ class WelcomeCustomizationPlugin(Star):
                     "message": with_group.get("messages", []),
                 },
             ),
+            ("send_private_forward_msg", with_group),
             (
                 "send_msg",
                 {
@@ -1572,16 +1588,14 @@ class WelcomeCustomizationPlugin(Star):
         source_forward_id = str(record.get("source_forward_id") or "").strip()
         target_group_id = str(origin_group_id or source_group_id or "").strip()
         preferred = str(record.get("last_strategy") or "").strip()
-        strategies: list[str] = []
+        strategies: list[str] = ["forward_friend_single_msg"]
         if source_forward_id:
             strategies.append("forward_segment_private")
-        strategies.append("forward_node_id_private")
-        if not target_group_id:
-            strategies.append("forward_friend_single_msg")
         if target_group_id:
             strategies.append("forward_node_id_private_without_group")
-            strategies.append("forward_friend_single_msg")
+            strategies.append("forward_node_id_private")
         else:
+            strategies.append("forward_node_id_private")
             strategies.append("forward_node_id_private_without_group")
         if trusted_only:
             strategies = [
@@ -1589,14 +1603,7 @@ class WelcomeCustomizationPlugin(Star):
                 for strategy in strategies
                 if self._trusted_direct_record_strategy(strategy)
             ]
-        prefer_allowed = not (
-            preferred == "forward_friend_single_msg" and bool(target_group_id)
-        )
-        if (
-            prefer_allowed
-            and self._trusted_direct_record_strategy(preferred)
-            and preferred in strategies
-        ):
+        if self._trusted_direct_record_strategy(preferred) and preferred in strategies:
             strategies.remove(preferred)
             strategies.insert(0, preferred)
 
@@ -2402,6 +2409,7 @@ class WelcomeCustomizationPlugin(Star):
                 routing,
                 str(event.get_group_id() or record.get("source_group_id") or ""),
                 stop_on_success=True,
+                trusted_only=True,
             )
         except Exception as e:
             results = [{"strategy": "direct_source", "ok": False, "error": str(e)}]
@@ -2580,16 +2588,16 @@ class WelcomeCustomizationPlugin(Star):
         seen: set[str] = set()
         unresolved: list[str] = []
         for node in nodes:
-            prepared_node = await self._prepare_record_node_for_send(
-                bot,
-                deepcopy(node),
-                routing,
-                0,
-                seen,
-                unresolved,
+            prepared.extend(
+                await self._prepare_record_node_for_send(
+                    bot,
+                    deepcopy(node),
+                    routing,
+                    0,
+                    seen,
+                    unresolved,
+                ),
             )
-            if prepared_node and prepared_node.get("content"):
-                prepared.append(prepared_node)
         if not prepared:
             raise ValueError("聊天记录内容为空")
         return prepared
@@ -2885,14 +2893,6 @@ class WelcomeCustomizationPlugin(Star):
             for item in WelcomeCustomizationPlugin._walk_json_values(data)
             if isinstance(item, str)
         )
-        strong_hints = (
-            "com.tencent.multimsg",
-            "multimsg",
-            "multi_msg",
-        )
-        if any(hint.lower() in haystack for hint in strong_hints):
-            return True
-
         resource_keys = {
             "mresid",
             "resid",
@@ -2915,6 +2915,13 @@ class WelcomeCustomizationPlugin(Star):
 
         if not has_forward_resource_key(data):
             return False
+        strong_hints = (
+            "com.tencent.multimsg",
+            "multimsg",
+            "multi_msg",
+        )
+        if any(hint.lower() in haystack for hint in strong_hints):
+            return True
         text_hints = (
             "[聊天记录]",
             "聊天记录",
@@ -2931,8 +2938,6 @@ class WelcomeCustomizationPlugin(Star):
             "forwardid",
             "forwardmsgid",
             "multimsgid",
-            "file",
-            "id",
         }
         candidates: list[tuple[int, str]] = []
 
@@ -2945,10 +2950,6 @@ class WelcomeCustomizationPlugin(Star):
                 return 0
             if key in {"forwardid", "forwardmsgid", "multimsgid"}:
                 return 1
-            if key == "file":
-                return 2
-            if key == "id":
-                return 3
             return 9
 
         def visit(value: Any, key: str = "") -> None:
