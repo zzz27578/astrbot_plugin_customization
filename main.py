@@ -1429,7 +1429,6 @@ class WelcomeCustomizationPlugin(Star):
         group_id = int(origin_group_id)
         with_group = {**base, "group_id": group_id}
         return [
-            ("send_private_msg", with_group),
             (
                 "send_msg",
                 {
@@ -1438,6 +1437,8 @@ class WelcomeCustomizationPlugin(Star):
                     "sub_type": "group",
                 },
             ),
+            ("send_private_msg", with_group),
+            ("send_private_msg", base),
         ]
 
     async def _call_send_attempts(
@@ -1687,6 +1688,18 @@ class WelcomeCustomizationPlugin(Star):
     ) -> None:
         wait_seconds = float(self.store["settings"].get("delivery_confirm_wait_seconds", 8))
         errors: list[str] = []
+        if origin_group_id:
+            try:
+                await self._send_original_node_to_temp_chat_confirmed(
+                    bot,
+                    user_id,
+                    message_id,
+                    routing,
+                    origin_group_id,
+                )
+                return
+            except Exception as e:
+                errors.append(f"send_msg_temp_node: {e}")
         for action in ("forward_friend_single_msg", "forward_group_single_msg"):
             started_at = int(time.time())
             try:
@@ -1761,6 +1774,18 @@ class WelcomeCustomizationPlugin(Star):
     ) -> None:
         wait_seconds = float(self.store["settings"].get("delivery_confirm_wait_seconds", 8))
         errors: list[str] = []
+        if origin_group_id:
+            try:
+                await self._send_original_node_to_temp_chat_confirmed(
+                    bot,
+                    user_id,
+                    message_id,
+                    routing,
+                    origin_group_id,
+                )
+                return
+            except Exception as e:
+                errors.append(f"send_msg_temp_node: {e}")
         for action in ("forward_friend_single_msg", "forward_group_single_msg"):
             started_at = int(time.time())
             try:
@@ -1783,18 +1808,6 @@ class WelcomeCustomizationPlugin(Star):
             ):
                 return
             errors.append(f"{action}: API returned success but private history did not confirm delivery")
-        if origin_group_id:
-            try:
-                await self._send_original_node_to_temp_chat_confirmed(
-                    bot,
-                    user_id,
-                    message_id,
-                    routing,
-                    origin_group_id,
-                )
-                return
-            except Exception as e:
-                errors.append(f"send_msg_temp_node: {e}")
         raise RuntimeError("; ".join(errors) or "forward original message failed")
 
     async def _send_forward_id_private_confirmed(
@@ -1861,7 +1874,7 @@ class WelcomeCustomizationPlugin(Star):
         with_group = {**params, "group_id": group_id}
         return [
             (
-                "send_forward_msg",
+                "send_msg",
                 {
                     **with_group,
                     "message_type": "private",
@@ -1871,7 +1884,7 @@ class WelcomeCustomizationPlugin(Star):
             ),
             ("send_private_forward_msg", with_group),
             (
-                "send_msg",
+                "send_forward_msg",
                 {
                     **with_group,
                     "message_type": "private",
