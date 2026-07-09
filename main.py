@@ -1027,6 +1027,10 @@ class WelcomeCustomizationPlugin(Star):
             return bool(record.get("source_message_id"))
         return bool(record.get("nodes"))
 
+    @staticmethod
+    def _trusted_direct_record_strategy(strategy: str) -> bool:
+        return strategy in {"forward_friend_single_msg", "forward_segment_private"}
+
     async def _send_direct_record(
         self,
         bot: Any,
@@ -1046,7 +1050,11 @@ class WelcomeCustomizationPlugin(Star):
         winner = next((item for item in attempts if item.get("ok")), None)
         if winner:
             strategy = winner.get("strategy", "")
-            if strategy and record.get("last_strategy") != strategy:
+            if (
+                strategy
+                and self._trusted_direct_record_strategy(strategy)
+                and record.get("last_strategy") != strategy
+            ):
                 record["last_strategy"] = strategy
                 record["updated_at"] = int(time.time())
                 self._save()
@@ -1072,14 +1080,16 @@ class WelcomeCustomizationPlugin(Star):
         source_forward_id = str(record.get("source_forward_id") or "").strip()
         target_group_id = str(origin_group_id or source_group_id or "").strip()
         preferred = str(record.get("last_strategy") or "").strip()
-        strategies = [
-            "forward_node_id_private",
-            "forward_friend_single_msg",
-            "forward_node_id_private_without_group",
-        ]
+        strategies = ["forward_friend_single_msg"]
         if source_forward_id:
             strategies.append("forward_segment_private")
-        if preferred in strategies:
+        strategies.extend(
+            [
+                "forward_node_id_private",
+                "forward_node_id_private_without_group",
+            ],
+        )
+        if self._trusted_direct_record_strategy(preferred) and preferred in strategies:
             strategies.remove(preferred)
             strategies.insert(0, preferred)
 
@@ -1724,10 +1734,14 @@ class WelcomeCustomizationPlugin(Star):
             stop_on_success=True,
         )
         winner = next((item for item in results if item.get("ok")), None)
+        trusted_winner = None
         if winner:
-            record["last_strategy"] = winner.get("strategy", "")
-            record["updated_at"] = int(time.time())
-            self._save()
+            strategy = winner.get("strategy", "")
+            if self._trusted_direct_record_strategy(strategy):
+                trusted_winner = winner
+                record["last_strategy"] = strategy
+                record["updated_at"] = int(time.time())
+                self._save()
         lines = [
             f"原消息直转探测：{record.get('name', name)}",
             f"目标 QQ：{target}",
@@ -1737,8 +1751,13 @@ class WelcomeCustomizationPlugin(Star):
             status = "成功" if item.get("ok") else "失败"
             detail = item.get("error") or ""
             lines.append(f"{item.get('strategy')}：{status}{(' - ' + detail) if detail else ''}")
-        if winner:
-            lines.append(f"已记录优先策略：{winner.get('strategy')}")
+        if trusted_winner:
+            lines.append(f"已记录优先策略：{trusted_winner.get('strategy')}")
+        elif winner:
+            lines.append(
+                "该成功策略只是兜底路径，NapCat 可能返回成功但 QQ 显示 0 条；"
+                "请以接收端实际展开结果为准，插件不会把它记为优先策略。",
+            )
         else:
             lines.append("没有策略成功。若原消息已过期或不在当前 NapCat 消息缓存中，需要重新引用最近的原始消息再采集。")
         return "\n".join(lines)
@@ -1840,10 +1859,19 @@ class WelcomeCustomizationPlugin(Star):
         routing: dict[str, Any],
     ) -> list[dict[str, Any]]:
         prepared: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        unresolved: list[str] = []
         for node in nodes:
-            normalized = self._normalize_node_data(deepcopy(node))
-            if normalized.get("content"):
-                prepared.append(normalized)
+            prepared.extend(
+                await self._expand_record_node(
+                    bot,
+                    deepcopy(node),
+                    routing,
+                    0,
+                    seen,
+                    unresolved,
+                ),
+            )
         if not prepared:
             raise ValueError("聊天记录内容为空")
         return prepared
@@ -1905,22 +1933,7 @@ class WelcomeCustomizationPlugin(Star):
             if not forward_id:
                 content.append(segment)
                 continue
-            try:
-                expanded = await self._fetch_forward_nodes(
-                    bot,
-                    forward_id,
-                    routing,
-                    depth,
-                    seen,
-                    unresolved,
-                )
-            except Exception:
-                logger.exception("展开嵌套合并转发失败：%s", forward_id)
-                expanded = []
-            if expanded:
-                nested_nodes.extend(expanded)
-            else:
-                unresolved.append(forward_id)
+            content.append({"type": "forward", "data": {"id": forward_id}})
         return content, nested_nodes
 
     @staticmethod
@@ -2020,16 +2033,171 @@ class WelcomeCustomizationPlugin(Star):
 
     @staticmethod
     def _forward_id_from_segment(segment: Any) -> str:
-        if not isinstance(segment, dict) or segment.get("type") != "forward":
+        if not isinstance(segment, dict):
+            return ""
+        if segment.get("type") == "json":
+            data = segment.get("data") or {}
+            forward_segment = WelcomeCustomizationPlugin._json_card_to_forward_segment(
+                data.get("data") if isinstance(data, dict) and "data" in data else data,
+            )
+            if forward_segment:
+                return WelcomeCustomizationPlugin._forward_id_from_segment(forward_segment)
+            return ""
+        if segment.get("type") != "forward":
             return ""
         data = segment.get("data") or {}
-        return str(
+        if not isinstance(data, dict):
+            return ""
+        direct = WelcomeCustomizationPlugin._valid_forward_id_candidate(
             data.get("id")
             or data.get("res_id")
+            or data.get("resId")
             or data.get("forward_id")
+            or data.get("forwardId")
             or data.get("file")
             or "",
         )
+        if direct:
+            return direct
+        nested = WelcomeCustomizationPlugin._extract_forward_id_from_json_card(data)
+        if nested:
+            return nested
+        return ""
+
+    @staticmethod
+    def _json_card_to_forward_segment(value: Any) -> dict[str, Any] | None:
+        data = WelcomeCustomizationPlugin._parse_json_card_payload(value)
+        if not WelcomeCustomizationPlugin._looks_like_forward_json_card(data):
+            return None
+        forward_id = WelcomeCustomizationPlugin._extract_forward_id_from_json_card(data)
+        if not forward_id:
+            return None
+        return {"type": "forward", "data": {"id": forward_id}}
+
+    @staticmethod
+    def _parse_json_card_payload(value: Any, depth: int = 0) -> Any:
+        if depth > 8:
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith(("{", "[")):
+                try:
+                    return WelcomeCustomizationPlugin._parse_json_card_payload(
+                        json.loads(text),
+                        depth + 1,
+                    )
+                except Exception:
+                    return value
+            return value
+        if isinstance(value, dict):
+            return {
+                key: WelcomeCustomizationPlugin._parse_json_card_payload(item, depth + 1)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                WelcomeCustomizationPlugin._parse_json_card_payload(item, depth + 1)
+                for item in value
+            ]
+        return value
+
+    @staticmethod
+    def _looks_like_forward_json_card(data: Any) -> bool:
+        haystack = "\n".join(
+            str(item).lower()
+            for item in WelcomeCustomizationPlugin._walk_json_values(data)
+            if isinstance(item, str)
+        )
+        hints = (
+            "com.tencent.multimsg",
+            "multimsg",
+            "multi_msg",
+            "[聊天记录]",
+            "聊天记录",
+            "群聊的聊天记录",
+            "转发消息",
+        )
+        return any(hint.lower() in haystack for hint in hints)
+
+    @staticmethod
+    def _extract_forward_id_from_json_card(data: Any) -> str:
+        preferred_keys = {
+            "mresid",
+            "resid",
+            "forwardid",
+            "forwardmsgid",
+            "multimsgid",
+            "file",
+            "id",
+        }
+        candidates: list[tuple[int, str]] = []
+
+        def normalize_key(value: Any) -> str:
+            return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+        def rank_key(value: Any) -> int:
+            key = normalize_key(value)
+            if key in {"mresid", "resid"}:
+                return 0
+            if key in {"forwardid", "forwardmsgid", "multimsgid"}:
+                return 1
+            if key == "file":
+                return 2
+            if key == "id":
+                return 3
+            return 9
+
+        def visit(value: Any, key: str = "") -> None:
+            if isinstance(value, dict):
+                for item_key, item_value in value.items():
+                    if normalize_key(item_key) in preferred_keys:
+                        candidate = WelcomeCustomizationPlugin._valid_forward_id_candidate(item_value)
+                        if candidate:
+                            candidates.append((rank_key(item_key), candidate))
+                    visit(item_value, str(item_key))
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item, key)
+
+        visit(data)
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
+
+    @staticmethod
+    def _valid_forward_id_candidate(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        candidate = value.strip()
+        if len(candidate) < 12 or len(candidate) > 512:
+            return ""
+        lowered = candidate.lower()
+        if lowered.startswith(("http://", "https://", "{", "[")):
+            return ""
+        if re.search(r"[\u4e00-\u9fff]", candidate):
+            return ""
+        if re.search(r"\s", candidate):
+            return ""
+        return candidate
+
+    @staticmethod
+    def _walk_json_values(data: Any) -> list[Any]:
+        values: list[Any] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for item_key, item_value in value.items():
+                    values.append(str(item_key))
+                    visit(item_value)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+            else:
+                values.append(value)
+
+        visit(data)
+        return values
 
     @staticmethod
     def _reply_chain(
@@ -2056,9 +2224,16 @@ class WelcomeCustomizationPlugin(Star):
             if segment.get("type") == "reply":
                 continue
             data = segment.get("data") or {}
-            if segment.get("type") == "json" and not isinstance(data.get("data"), str):
-                data = dict(data)
-                data["data"] = self._json_segment_to_raw(data.get("data"))
+            if segment.get("type") == "json":
+                forward_segment = self._json_card_to_forward_segment(
+                    data.get("data") if isinstance(data, dict) and "data" in data else data,
+                )
+                if forward_segment:
+                    ret.append(forward_segment)
+                    continue
+                if not isinstance(data.get("data"), str):
+                    data = dict(data)
+                    data["data"] = self._json_segment_to_raw(data.get("data"))
             ret.append({"type": segment["type"], "data": data})
         return ret
 
@@ -2075,12 +2250,16 @@ class WelcomeCustomizationPlugin(Star):
                     },
                 )
             elif isinstance(component, Json):
-                ret.append(
-                    {
-                        "type": "json",
-                        "data": {"data": self._json_segment_to_raw(component.data)},
-                    },
-                )
+                forward_segment = self._json_card_to_forward_segment(component.data)
+                if forward_segment:
+                    ret.append(forward_segment)
+                else:
+                    ret.append(
+                        {
+                            "type": "json",
+                            "data": {"data": self._json_segment_to_raw(component.data)},
+                        },
+                    )
             elif isinstance(component, Forward):
                 ret.append({"type": "forward", "data": {"id": str(component.id)}})
             elif isinstance(component, At):
