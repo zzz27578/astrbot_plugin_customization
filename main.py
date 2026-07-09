@@ -25,6 +25,15 @@ SEND_STEPS = {"card", "record", "image", "text"}
 FORWARD_EXPAND_MAX_DEPTH = 6
 
 
+class ForwardExpandError(RuntimeError):
+    def __init__(self, unresolved_ids: list[str]) -> None:
+        self.unresolved_ids = unresolved_ids
+        preview = "、".join(unresolved_ids[:5])
+        if len(unresolved_ids) > 5:
+            preview += f" 等 {len(unresolved_ids)} 个"
+        super().__init__(f"嵌套聊天记录无法展开：{preview}")
+
+
 DEFAULT_SETTINGS: dict[str, Any] = {
     "enabled": True,
     "mode": "all",
@@ -1182,7 +1191,10 @@ class WelcomeCustomizationPlugin(Star):
         action = self._normalize_action_word(args[0])
         if action == "添加":
             name = args[1] if len(args) > 1 else f"聊天记录{len(self.store['records']) + 1}"
-            nodes = await self._extract_record_nodes(event)
+            try:
+                nodes = await self._extract_record_nodes(event)
+            except ForwardExpandError as e:
+                return f"该聊天记录包含 NapCat 无法读取的内层消息，未保存。{e}"
             if not nodes:
                 return "没有在引用消息中找到可保存的聊天记录内容。"
             record_id = self._find_material_id_by_name("records", name)
@@ -1480,6 +1492,8 @@ class WelcomeCustomizationPlugin(Star):
                         "time": ret.get("time"),
                         "content": self._normalize_raw_segments(ret.get("message", [])),
                     }
+                except ForwardExpandError:
+                    raise
                 except Exception:
                     logger.exception("读取引用消息失败，尝试使用 AstrBot Reply 组件。")
 
@@ -1495,6 +1509,8 @@ class WelcomeCustomizationPlugin(Star):
                             )
                             if nodes:
                                 return {"nodes": nodes}
+                        except ForwardExpandError:
+                            raise
                         except Exception:
                             logger.exception("读取引用合并转发消息失败。")
                 return {
@@ -1512,13 +1528,18 @@ class WelcomeCustomizationPlugin(Star):
         routing: dict[str, Any],
         depth: int = 0,
         seen: set[str] | None = None,
+        unresolved: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        owns_unresolved = unresolved is None
+        unresolved = unresolved if unresolved is not None else []
         if depth >= FORWARD_EXPAND_MAX_DEPTH:
             logger.warning("合并转发嵌套层级过深，停止展开：%s", forward_id)
+            unresolved.append(forward_id)
             return []
         seen = set(seen or ())
         if forward_id in seen:
             logger.warning("合并转发出现循环引用，停止展开：%s", forward_id)
+            unresolved.append(forward_id)
             return []
         seen.add(forward_id)
         ret = await bot.call_action("get_forward_msg", id=forward_id, **routing)
@@ -1533,8 +1554,11 @@ class WelcomeCustomizationPlugin(Star):
                     routing,
                     depth + 1,
                     seen,
+                    unresolved,
                 ),
             )
+        if owns_unresolved and unresolved:
+            raise ForwardExpandError(unresolved)
         return nodes
 
     async def _prepare_record_nodes_for_send(
@@ -1544,6 +1568,7 @@ class WelcomeCustomizationPlugin(Star):
         routing: dict[str, Any],
     ) -> list[dict[str, Any]]:
         expanded: list[dict[str, Any]] = []
+        unresolved: list[str] = []
         for node in nodes:
             expanded.extend(
                 await self._expand_record_node(
@@ -1552,8 +1577,11 @@ class WelcomeCustomizationPlugin(Star):
                     routing,
                     0,
                     set(),
+                    unresolved,
                 ),
             )
+        if unresolved:
+            raise ForwardExpandError(unresolved)
         if not expanded:
             raise ValueError("聊天记录内容为空，或嵌套聊天记录无法展开")
         return expanded
@@ -1565,6 +1593,7 @@ class WelcomeCustomizationPlugin(Star):
         routing: dict[str, Any],
         depth: int,
         seen: set[str],
+        unresolved: list[str],
     ) -> list[dict[str, Any]]:
         if not node:
             return []
@@ -1575,6 +1604,7 @@ class WelcomeCustomizationPlugin(Star):
             routing,
             depth,
             seen,
+            unresolved,
         )
         result: list[dict[str, Any]] = []
         if content:
@@ -1590,10 +1620,25 @@ class WelcomeCustomizationPlugin(Star):
         routing: dict[str, Any],
         depth: int,
         seen: set[str],
+        unresolved: list[str],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         content: list[dict[str, Any]] = []
         nested_nodes: list[dict[str, Any]] = []
         for segment in self._normalize_raw_segments(segments):
+            embedded_nodes = self._embedded_forward_nodes_from_segment(segment)
+            if embedded_nodes:
+                for node in embedded_nodes:
+                    nested_nodes.extend(
+                        await self._expand_record_node(
+                            bot,
+                            self._forward_message_to_node(node),
+                            routing,
+                            depth + 1,
+                            seen,
+                            unresolved,
+                        ),
+                    )
+                continue
             forward_id = self._forward_id_from_segment(segment)
             if not forward_id:
                 content.append(segment)
@@ -1605,6 +1650,7 @@ class WelcomeCustomizationPlugin(Star):
                     routing,
                     depth,
                     seen,
+                    unresolved,
                 )
             except Exception:
                 logger.exception("展开嵌套合并转发失败：%s", forward_id)
@@ -1612,12 +1658,7 @@ class WelcomeCustomizationPlugin(Star):
             if expanded:
                 nested_nodes.extend(expanded)
             else:
-                content.append(
-                    {
-                        "type": "text",
-                        "data": {"text": "[嵌套聊天记录暂时无法展开，请重新采集该素材]"},
-                    },
-                )
+                unresolved.append(forward_id)
         return content, nested_nodes
 
     @staticmethod
@@ -1632,6 +1673,27 @@ class WelcomeCustomizationPlugin(Star):
                 return value
             if isinstance(value, dict):
                 nested = value.get("messages") or value.get("message")
+                if isinstance(nested, list):
+                    return nested
+        return []
+
+    @staticmethod
+    def _embedded_forward_nodes_from_segment(segment: Any) -> list[Any]:
+        if not isinstance(segment, dict) or segment.get("type") not in (
+            "forward",
+            "forward_msg",
+            "nodes",
+        ):
+            return []
+        data = segment.get("data") or {}
+        if not isinstance(data, dict):
+            return []
+        for key in ("content", "messages", "message", "nodes"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = value.get("content") or value.get("messages") or value.get("message")
                 if isinstance(nested, list):
                     return nested
         return []
