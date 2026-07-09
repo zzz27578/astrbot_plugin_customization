@@ -1688,26 +1688,19 @@ class WelcomeCustomizationPlugin(Star):
     ) -> None:
         wait_seconds = float(self.store["settings"].get("delivery_confirm_wait_seconds", 8))
         errors: list[str] = []
-        if origin_group_id:
-            try:
-                await self._send_original_node_to_temp_chat_confirmed(
-                    bot,
-                    user_id,
-                    message_id,
-                    routing,
-                    origin_group_id,
-                )
-                return
-            except Exception as e:
-                errors.append(f"send_msg_temp_node: {e}")
         for action in ("forward_friend_single_msg", "forward_group_single_msg"):
             started_at = int(time.time())
             try:
+                params = {
+                    "user_id": int(user_id),
+                    "message_id": message_id,
+                    **routing,
+                }
+                if origin_group_id:
+                    params["group_id"] = int(origin_group_id)
                 await bot.call_action(
                     action,
-                    user_id=int(user_id),
-                    message_id=message_id,
-                    **routing,
+                    **params,
                 )
             except Exception as e:
                 errors.append(f"{action}: {e}")
@@ -1774,26 +1767,19 @@ class WelcomeCustomizationPlugin(Star):
     ) -> None:
         wait_seconds = float(self.store["settings"].get("delivery_confirm_wait_seconds", 8))
         errors: list[str] = []
-        if origin_group_id:
-            try:
-                await self._send_original_node_to_temp_chat_confirmed(
-                    bot,
-                    user_id,
-                    message_id,
-                    routing,
-                    origin_group_id,
-                )
-                return
-            except Exception as e:
-                errors.append(f"send_msg_temp_node: {e}")
         for action in ("forward_friend_single_msg", "forward_group_single_msg"):
             started_at = int(time.time())
             try:
+                params = {
+                    "user_id": int(user_id),
+                    "message_id": message_id,
+                    **routing,
+                }
+                if origin_group_id:
+                    params["group_id"] = int(origin_group_id)
                 await bot.call_action(
                     action,
-                    user_id=int(user_id),
-                    message_id=message_id,
-                    **routing,
+                    **params,
                 )
             except Exception as e:
                 errors.append(f"{action}: {e}")
