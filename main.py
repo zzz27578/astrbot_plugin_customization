@@ -1133,6 +1133,19 @@ class WelcomeCustomizationPlugin(Star):
                 await self._send_direct_record(bot, user_id, record, routing, origin_group_id)
                 await asyncio.sleep(DIRECT_RECORD_SETTLE_SECONDS)
                 return
+            root_forward_id = str(record.get("root_forward_id") or "").strip()
+            if origin_group_id and root_forward_id:
+                try:
+                    await self._send_record_forward_id(
+                        bot,
+                        user_id,
+                        root_forward_id,
+                        routing,
+                        origin_group_id,
+                    )
+                    return
+                except Exception:
+                    logger.exception("临时会话原始 forward 资源发送失败，尝试原消息转发。")
             source_message_id = str(record.get("root_message_id") or "").strip()
             if source_message_id:
                 forward_routing = dict(routing)
@@ -1465,6 +1478,7 @@ class WelcomeCustomizationPlugin(Star):
     @staticmethod
     def _trusted_direct_record_strategy(strategy: str) -> bool:
         return strategy in {
+            "forward_resource_msg",
             "forward_single_msg",
             "forward_group_single_msg",
             "forward_friend_single_msg",
@@ -1953,8 +1967,13 @@ class WelcomeCustomizationPlugin(Star):
         if not source_message_id:
             raise ValueError("直转记录缺少原消息 message_id")
         source_forward_id = str(record.get("source_forward_id") or "").strip()
+        source_group_id = str(record.get("source_group_id") or "").strip()
+        delivery_group_id = str(origin_group_id or source_group_id or "").strip()
         preferred = str(record.get("last_strategy") or "").strip()
-        strategies: list[str] = ["forward_single_msg"]
+        strategies: list[str] = []
+        if source_forward_id:
+            strategies.append("forward_resource_msg")
+        strategies.append("forward_single_msg")
         if trusted_only:
             strategies = [
                 strategy
@@ -1969,7 +1988,15 @@ class WelcomeCustomizationPlugin(Star):
         for strategy in strategies:
             started_at = int(time.time())
             try:
-                if strategy == "forward_single_msg":
+                if strategy == "forward_resource_msg":
+                    await self._send_forward_id_private_confirmed(
+                        bot,
+                        user_id,
+                        source_forward_id,
+                        routing,
+                        delivery_group_id or None,
+                    )
+                elif strategy == "forward_single_msg":
                     await self._forward_single_message_to_user(
                         bot,
                         user_id,
@@ -1988,7 +2015,10 @@ class WelcomeCustomizationPlugin(Star):
                         "",
                         routing,
                     )
-                if confirm_delivery and strategy != "forward_single_msg":
+                if confirm_delivery and strategy not in {
+                    "forward_single_msg",
+                    "forward_resource_msg",
+                }:
                     wait_seconds = float(
                         self.store["settings"].get("delivery_confirm_wait_seconds", 8),
                     )
