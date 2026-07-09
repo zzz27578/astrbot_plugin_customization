@@ -185,7 +185,7 @@ function renderMaterials(containerId, items, activeId, kind) {
       <div class="item-head">
         <div class="item-title">
           <strong>${escapeHtml(item.name)}</strong>
-          <span>${formatTime(item.created_at)}${kind === "record" ? ` · ${item.nodes?.length || 0} 个节点` : ""}</span>
+          <span>${formatTime(item.created_at)}${kind === "record" ? ` · ${recordMeta(item)}` : ""}</span>
         </div>
         <div class="item-actions">
           <button class="small" data-action="activate" data-kind="${kind}" data-id="${item.id}" type="button">启用</button>
@@ -215,7 +215,21 @@ function previewFor(item, kind) {
   if (kind === "image") {
     return `<p class="muted">${escapeHtml(item.kind === "local" ? "本地上传图片" : item.source || "")}</p>`;
   }
+  if (kind === "record" && item.mode === "direct_forward") {
+    return `
+      <p class="muted">原消息直转，发送时由 NapCat 按原消息位置转发。</p>
+      <p class="muted">消息 ${escapeHtml(item.source_message_id || "-")} · 来源群 ${escapeHtml(item.source_group_id || "-")}</p>
+      <p class="muted">优先策略 ${escapeHtml(item.last_strategy || "未探测")}</p>
+    `;
+  }
   return `<p class="muted">发送时使用 OneBot 合并转发消息</p>`;
+}
+
+function recordMeta(item) {
+  if (item.mode === "direct_forward") {
+    return "原消息直转";
+  }
+  return `${item.nodes?.length || 0} 个节点`;
 }
 
 function renderLogs(logs) {

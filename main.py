@@ -766,8 +766,11 @@ class WelcomeCustomizationPlugin(Star):
             return
         if step == "record":
             record = self._active_item("records", "active_record_id")
-            if not record or not record.get("nodes"):
+            if not record or not self._record_has_content(record):
                 raise ValueError("未设置启用聊天记录")
+            if self._record_is_direct(record):
+                await self._send_direct_record(bot, user_id, record, routing, origin_group_id)
+                return
             nodes = await self._prepare_record_nodes_for_send(
                 bot,
                 record.get("nodes", []),
@@ -824,7 +827,7 @@ class WelcomeCustomizationPlugin(Star):
             return bool(self._active_item("cards", "active_card_id"))
         if step == "record":
             record = self._active_item("records", "active_record_id")
-            return bool(record and record.get("nodes"))
+            return bool(record and self._record_has_content(record))
         if step == "image":
             return bool(self._active_item("images", "active_image_id"))
         if step == "text":
@@ -1016,6 +1019,141 @@ class WelcomeCustomizationPlugin(Star):
             params["group_id"] = int(origin_group_id)
         await bot.call_action("send_private_msg", **params)
 
+    def _record_is_direct(self, record: dict[str, Any]) -> bool:
+        return str(record.get("mode") or "") == "direct_forward"
+
+    def _record_has_content(self, record: dict[str, Any]) -> bool:
+        if self._record_is_direct(record):
+            return bool(record.get("source_message_id"))
+        return bool(record.get("nodes"))
+
+    async def _send_direct_record(
+        self,
+        bot: Any,
+        user_id: str,
+        record: dict[str, Any],
+        routing: dict[str, Any],
+        origin_group_id: str | None = None,
+    ) -> None:
+        attempts = await self._try_direct_record_strategies(
+            bot,
+            user_id,
+            record,
+            routing,
+            origin_group_id,
+            stop_on_success=True,
+        )
+        winner = next((item for item in attempts if item.get("ok")), None)
+        if winner:
+            strategy = winner.get("strategy", "")
+            if strategy and record.get("last_strategy") != strategy:
+                record["last_strategy"] = strategy
+                record["updated_at"] = int(time.time())
+                self._save()
+            return
+        errors = "；".join(
+            f"{item.get('strategy')}: {item.get('error')}" for item in attempts
+        )
+        raise RuntimeError(errors or "原消息直转失败")
+
+    async def _try_direct_record_strategies(
+        self,
+        bot: Any,
+        user_id: str,
+        record: dict[str, Any],
+        routing: dict[str, Any],
+        origin_group_id: str | None = None,
+        stop_on_success: bool = False,
+    ) -> list[dict[str, Any]]:
+        source_message_id = str(record.get("source_message_id") or "").strip()
+        if not source_message_id:
+            raise ValueError("直转记录缺少原消息 message_id")
+        source_group_id = str(record.get("source_group_id") or "").strip()
+        source_forward_id = str(record.get("source_forward_id") or "").strip()
+        target_group_id = str(origin_group_id or source_group_id or "").strip()
+        preferred = str(record.get("last_strategy") or "").strip()
+        strategies = [
+            "forward_node_id_private",
+            "forward_friend_single_msg",
+            "forward_node_id_private_without_group",
+        ]
+        if source_forward_id:
+            strategies.append("forward_segment_private")
+        if preferred in strategies:
+            strategies.remove(preferred)
+            strategies.insert(0, preferred)
+
+        results: list[dict[str, Any]] = []
+        for strategy in strategies:
+            try:
+                await self._send_direct_record_by_strategy(
+                    bot,
+                    strategy,
+                    user_id,
+                    source_message_id,
+                    source_forward_id,
+                    target_group_id,
+                    routing,
+                )
+                result = {"strategy": strategy, "ok": True, "error": ""}
+                results.append(result)
+                if stop_on_success:
+                    break
+            except Exception as e:
+                results.append({"strategy": strategy, "ok": False, "error": str(e)})
+        return results
+
+    async def _send_direct_record_by_strategy(
+        self,
+        bot: Any,
+        strategy: str,
+        user_id: str,
+        source_message_id: str,
+        source_forward_id: str,
+        target_group_id: str,
+        routing: dict[str, Any],
+    ) -> None:
+        if strategy == "forward_node_id_private":
+            params = {
+                "user_id": int(user_id),
+                "messages": [
+                    {"type": "node", "data": {"id": source_message_id}},
+                ],
+                **routing,
+            }
+            if target_group_id:
+                params["group_id"] = int(target_group_id)
+            await bot.call_action("send_private_forward_msg", **params)
+            return
+        if strategy == "forward_node_id_private_without_group":
+            await bot.call_action(
+                "send_private_forward_msg",
+                user_id=int(user_id),
+                messages=[{"type": "node", "data": {"id": source_message_id}}],
+                **routing,
+            )
+            return
+        if strategy == "forward_friend_single_msg":
+            await bot.call_action(
+                "forward_friend_single_msg",
+                user_id=int(user_id),
+                message_id=source_message_id,
+                **routing,
+            )
+            return
+        if strategy == "forward_segment_private":
+            if not source_forward_id:
+                raise ValueError("直转记录缺少合并转发 id")
+            await self._send_private_payload(
+                bot,
+                user_id,
+                [{"type": "forward", "data": {"id": source_forward_id}}],
+                routing,
+                target_group_id or None,
+            )
+            return
+        raise ValueError(f"未知直转策略：{strategy}")
+
     def _active_item(self, collection: str, active_key: str) -> dict[str, Any] | None:
         item_id = self.store["settings"].get(active_key)
         if not item_id:
@@ -1187,14 +1325,14 @@ class WelcomeCustomizationPlugin(Star):
 
     async def _record_command(self, event: AstrMessageEvent, args: list[str]) -> str:
         if not args:
-            return "用法：/记录 添加 名称；/记录 使用 名称；/记录 列表；/记录 删除 名称"
+            return "用法：/记录 添加 名称；/记录 直转 名称；/记录 探测 名称 QQ；/记录 使用 名称；/记录 列表；/记录 删除 名称"
         action = self._normalize_action_word(args[0])
         if action == "添加":
             name = args[1] if len(args) > 1 else f"聊天记录{len(self.store['records']) + 1}"
             try:
                 nodes = await self._extract_record_nodes(event)
             except ForwardExpandError as e:
-                return f"该聊天记录包含 NapCat 无法读取的内层消息，未保存。{e}"
+                return f"该聊天记录包含 NapCat 无法读取的内层消息，未保存。{e}\n可改用 /记录 直转 名称 保存原消息直转素材。"
             if not nodes:
                 return "没有在引用消息中找到可保存的聊天记录内容。"
             record_id = self._find_material_id_by_name("records", name)
@@ -1206,11 +1344,55 @@ class WelcomeCustomizationPlugin(Star):
                     "nodes": [],
                     "created_at": int(time.time()),
                 }
+            self.store["records"][record_id]["mode"] = "nodes"
             self.store["records"][record_id]["nodes"].extend(nodes)
+            for key in (
+                "source_message_id",
+                "source_group_id",
+                "source_user_id",
+                "source_self_id",
+                "source_forward_id",
+                "last_strategy",
+            ):
+                self.store["records"][record_id].pop(key, None)
             self.store["records"][record_id]["updated_at"] = int(time.time())
             self.store["settings"]["active_record_id"] = record_id
             self._save()
             return f"已保存 {len(nodes)} 个聊天记录节点到模板：{name}"
+        if action in {"直转", "原转发", "direct", "raw"}:
+            name = args[1] if len(args) > 1 else f"直转记录{len(self.store['records']) + 1}"
+            source = await self._extract_direct_record_source(event)
+            if not source:
+                return "没有找到可直转的引用消息。请回复原始聊天记录消息后执行 /记录 直转 名称。"
+            record_id = self._find_material_id_by_name("records", name)
+            if not record_id:
+                record_id = uuid.uuid4().hex
+                self.store["records"][record_id] = {
+                    "id": record_id,
+                    "name": name,
+                    "created_at": int(time.time()),
+                }
+            self.store["records"][record_id].update(
+                {
+                    "mode": "direct_forward",
+                    "nodes": [],
+                    "updated_at": int(time.time()),
+                    **source,
+                },
+            )
+            self.store["settings"]["active_record_id"] = record_id
+            self._save()
+            return (
+                f"已保存并启用原消息直转记录：{name}\n"
+                "建议立即执行 /记录 探测 "
+                f"{name} QQ号，确认当前 NapCat 能否原样转发嵌套聊天记录。"
+            )
+        if action in {"探测", "直转测试", "probe", "test_direct"}:
+            if len(args) < 2:
+                return "用法：/记录 探测 名称 QQ"
+            name = args[1]
+            target = args[2] if len(args) > 2 else event.get_sender_id()
+            return await self._probe_direct_record(event, name, str(target))
         return self._material_command("records", "active_record_id", "聊天记录", args)
 
     async def _image_command(self, event: AstrMessageEvent, args: list[str]) -> str:
@@ -1463,6 +1645,104 @@ class WelcomeCustomizationPlugin(Star):
             },
         ]
 
+    async def _extract_direct_record_source(
+        self,
+        event: AstrMessageEvent,
+    ) -> dict[str, Any] | None:
+        raw = getattr(event.message_obj, "raw_message", None)
+        if hasattr(raw, "get"):
+            reply_id = self._reply_id_from_raw(raw.get("message"))
+            if reply_id:
+                source: dict[str, Any] = {
+                    "source_message_id": str(reply_id),
+                    "source_group_id": str(raw.get("group_id") or event.get_group_id() or ""),
+                    "source_user_id": str(raw.get("user_id") or event.get_sender_id() or ""),
+                    "source_self_id": str(raw.get("self_id") or ""),
+                }
+                forward_id = await self._forward_id_from_message_id(event, reply_id, raw)
+                if forward_id:
+                    source["source_forward_id"] = forward_id
+                return source
+
+        for component in self._reply_chain(event, include_reply=True):
+            if isinstance(component, Reply):
+                reply_id = str(component.id or "")
+                if reply_id:
+                    return {
+                        "source_message_id": reply_id,
+                        "source_group_id": str(event.get_group_id() or ""),
+                        "source_user_id": str(component.sender_id or component.qq or ""),
+                        "source_self_id": "",
+                    }
+        return None
+
+    async def _forward_id_from_message_id(
+        self,
+        event: AstrMessageEvent,
+        message_id: str,
+        raw: Any,
+    ) -> str:
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return ""
+        try:
+            ret = await bot.call_action(
+                "get_msg",
+                message_id=int(message_id),
+                **({"self_id": raw.get("self_id")} if raw.get("self_id") else {}),
+            )
+        except Exception:
+            logger.exception("读取直转引用消息失败。")
+            return ""
+        return self._forward_id_from_raw(ret.get("message", []))
+
+    async def _probe_direct_record(
+        self,
+        event: AstrMessageEvent,
+        name: str,
+        target: str,
+    ) -> str:
+        record_id = self._find_material_id_by_name("records", name)
+        if not record_id:
+            return f"没有找到聊天记录：{name}"
+        record = self.store.get("records", {}).get(record_id)
+        if not isinstance(record, dict) or not self._record_is_direct(record):
+            return "该聊天记录不是原消息直转素材。请先回复原始聊天记录执行 /记录 直转 名称。"
+        bot = getattr(event, "bot", None)
+        if bot is None:
+            return "当前平台没有 aiocqhttp bot 客户端，无法探测。"
+        raw = getattr(event.message_obj, "raw_message", None)
+        routing = {}
+        if hasattr(raw, "get") and raw.get("self_id"):
+            routing["self_id"] = raw.get("self_id")
+        results = await self._try_direct_record_strategies(
+            bot,
+            target,
+            record,
+            routing,
+            str(event.get_group_id() or record.get("source_group_id") or ""),
+            stop_on_success=True,
+        )
+        winner = next((item for item in results if item.get("ok")), None)
+        if winner:
+            record["last_strategy"] = winner.get("strategy", "")
+            record["updated_at"] = int(time.time())
+            self._save()
+        lines = [
+            f"原消息直转探测：{record.get('name', name)}",
+            f"目标 QQ：{target}",
+            f"原消息：{record.get('source_message_id')}",
+        ]
+        for item in results:
+            status = "成功" if item.get("ok") else "失败"
+            detail = item.get("error") or ""
+            lines.append(f"{item.get('strategy')}：{status}{(' - ' + detail) if detail else ''}")
+        if winner:
+            lines.append(f"已记录优先策略：{winner.get('strategy')}")
+        else:
+            lines.append("没有策略成功。若原消息已过期或不在当前 NapCat 消息缓存中，需要重新引用最近的原始消息再采集。")
+        return "\n".join(lines)
+
     async def _reply_snapshot(self, event: AstrMessageEvent) -> dict[str, Any] | None:
         raw = getattr(event.message_obj, "raw_message", None)
         if hasattr(raw, "get"):
@@ -1547,16 +1827,8 @@ class WelcomeCustomizationPlugin(Star):
         nodes: list[dict[str, Any]] = []
         for item in messages:
             node = self._forward_message_to_node(item)
-            nodes.extend(
-                await self._expand_record_node(
-                    bot,
-                    node,
-                    routing,
-                    depth + 1,
-                    seen,
-                    unresolved,
-                ),
-            )
+            if node:
+                nodes.append(node)
         if owns_unresolved and unresolved:
             raise ForwardExpandError(unresolved)
         return nodes
@@ -1567,24 +1839,14 @@ class WelcomeCustomizationPlugin(Star):
         nodes: list[dict[str, Any]],
         routing: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        expanded: list[dict[str, Any]] = []
-        unresolved: list[str] = []
+        prepared: list[dict[str, Any]] = []
         for node in nodes:
-            expanded.extend(
-                await self._expand_record_node(
-                    bot,
-                    deepcopy(node),
-                    routing,
-                    0,
-                    set(),
-                    unresolved,
-                ),
-            )
-        if unresolved:
-            raise ForwardExpandError(unresolved)
-        if not expanded:
-            raise ValueError("聊天记录内容为空，或嵌套聊天记录无法展开")
-        return expanded
+            normalized = self._normalize_node_data(deepcopy(node))
+            if normalized.get("content"):
+                prepared.append(normalized)
+        if not prepared:
+            raise ValueError("聊天记录内容为空")
+        return prepared
 
     async def _expand_record_node(
         self,
