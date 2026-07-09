@@ -384,49 +384,44 @@ class WelcomeCustomizationPlugin(Star):
             data = segment.get("data") if isinstance(segment, dict) else None
             nested_nodes = data.get("_nested_nodes") if isinstance(data, dict) else None
             if segment.get("type") == "forward" and isinstance(nested_nodes, list):
-                for child in nested_nodes:
-                    extra_nodes.extend(
-                        await self._prepare_record_node_for_send(
-                            bot,
-                            deepcopy(child),
-                            routing,
-                            depth + 1,
-                            seen,
-                            unresolved,
-                        ),
-                    )
-                continue
-
-            forward_id = self._forward_id_from_segment(segment)
-            if forward_id:
-                nested = await self._fetch_forward_nodes(
+                nested_segment = await self._nodes_to_nested_node_segment(
                     bot,
-                    forward_id,
+                    nested_nodes,
                     routing,
                     depth + 1,
                     seen,
                     unresolved,
-                    "",
                 )
-                if nested:
-                    for child in nested:
-                        extra_nodes.extend(
-                            await self._prepare_record_node_for_send(
-                                bot,
-                                deepcopy(child),
-                                routing,
-                                depth + 1,
-                                seen,
-                                unresolved,
-                            ),
-                        )
+                if nested_segment:
+                    content.append(nested_segment)
                     continue
-                if segment.get("type") in {"forward", "json"}:
-                    content.append({"type": "forward", "data": {"id": forward_id}})
-                    continue
+
+            forward_id = self._forward_id_from_segment(segment)
+            if forward_id:
+                content.append({"type": "forward", "data": {"id": forward_id}})
+                continue
 
             embedded_nodes = self._embedded_forward_nodes_from_segment(segment)
             if embedded_nodes:
+                embedded_node_data = [
+                    node
+                    for node in (
+                        self._forward_message_to_node(child)
+                        for child in embedded_nodes
+                    )
+                    if node
+                ]
+                nested_segment = await self._nodes_to_nested_node_segment(
+                    bot,
+                    embedded_node_data,
+                    routing,
+                    depth + 1,
+                    seen,
+                    unresolved,
+                )
+                if nested_segment:
+                    content.append(nested_segment)
+                    continue
                 for child in embedded_nodes:
                     extra_nodes.extend(
                         await self._prepare_record_node_for_send(
@@ -1445,7 +1440,18 @@ class WelcomeCustomizationPlugin(Star):
 
     @staticmethod
     def _trusted_direct_record_strategy(strategy: str) -> bool:
-        return strategy in {"forward_friend_single_msg"}
+        return strategy in {"forward_group_single_msg", "forward_friend_single_msg"}
+
+    @staticmethod
+    def _direct_record_routing(
+        record: dict[str, Any],
+        routing: dict[str, Any],
+    ) -> dict[str, Any]:
+        ret = dict(routing)
+        source_self_id = str(record.get("source_self_id") or "").strip()
+        if source_self_id:
+            ret["self_id"] = source_self_id
+        return ret
 
     async def _send_direct_record(
         self,
@@ -1455,12 +1461,13 @@ class WelcomeCustomizationPlugin(Star):
         routing: dict[str, Any],
         origin_group_id: str | None = None,
     ) -> None:
+        direct_routing = self._direct_record_routing(record, routing)
         try:
             attempts = await self._try_direct_record_strategies(
                 bot,
                 user_id,
                 record,
-                routing,
+                direct_routing,
                 origin_group_id,
                 stop_on_success=True,
                 trusted_only=True,
@@ -1480,7 +1487,7 @@ class WelcomeCustomizationPlugin(Star):
         refresh_error = ""
         refreshed = False
         try:
-            refreshed = await self._refresh_direct_record_source(bot, record, routing)
+            refreshed = await self._refresh_direct_record_source(bot, record, direct_routing)
         except Exception as e:
             refresh_error = str(e)
         if refreshed:
@@ -1489,7 +1496,7 @@ class WelcomeCustomizationPlugin(Star):
                     bot,
                     user_id,
                     record,
-                    routing,
+                    direct_routing,
                     origin_group_id,
                     stop_on_success=True,
                     trusted_only=True,
@@ -1515,7 +1522,7 @@ class WelcomeCustomizationPlugin(Star):
                     bot,
                     user_id,
                     fallback_nodes,
-                    routing,
+                    direct_routing,
                     origin_group_id,
                 )
                 record["last_strategy"] = "local_backup_nodes"
@@ -1527,7 +1534,7 @@ class WelcomeCustomizationPlugin(Star):
                     record,
                     user_id,
                     origin_group_id,
-                    routing,
+                    direct_routing,
                     attempts,
                 )
                 self._save()
@@ -1548,7 +1555,7 @@ class WelcomeCustomizationPlugin(Star):
             record,
             user_id,
             origin_group_id,
-            routing,
+            direct_routing,
             errors or "原消息直转失败",
         )
         raise RuntimeError(errors or "原消息直转失败")
@@ -1738,9 +1745,12 @@ class WelcomeCustomizationPlugin(Star):
             raise ValueError("直转记录缺少原消息 message_id")
         source_group_id = str(record.get("source_group_id") or "").strip()
         source_forward_id = str(record.get("source_forward_id") or "").strip()
-        target_group_id = str(origin_group_id or source_group_id or "").strip()
+        target_group_id = str(source_group_id or origin_group_id or "").strip()
         preferred = str(record.get("last_strategy") or "").strip()
-        strategies: list[str] = ["forward_friend_single_msg"]
+        if target_group_id:
+            strategies: list[str] = ["forward_group_single_msg"]
+        else:
+            strategies = ["forward_friend_single_msg"]
         if source_forward_id:
             strategies.append("forward_segment_private")
         if target_group_id:
@@ -1813,6 +1823,17 @@ class WelcomeCustomizationPlugin(Star):
         if strategy == "forward_friend_single_msg":
             await bot.call_action(
                 "forward_friend_single_msg",
+                user_id=int(user_id),
+                message_id=source_message_id,
+                **routing,
+            )
+            return
+        if strategy == "forward_group_single_msg":
+            if not target_group_id:
+                raise ValueError("群原消息直转缺少来源群号")
+            await bot.call_action(
+                "forward_group_single_msg",
+                group_id=int(target_group_id),
                 user_id=int(user_id),
                 message_id=source_message_id,
                 **routing,
@@ -2554,12 +2575,13 @@ class WelcomeCustomizationPlugin(Star):
         routing = {}
         if hasattr(raw, "get") and raw.get("self_id"):
             routing["self_id"] = raw.get("self_id")
+        direct_routing = self._direct_record_routing(record, routing)
         try:
             results = await self._try_direct_record_strategies(
                 bot,
                 target,
                 record,
-                routing,
+                direct_routing,
                 str(event.get_group_id() or record.get("source_group_id") or ""),
                 stop_on_success=True,
                 trusted_only=True,
@@ -2594,7 +2616,7 @@ class WelcomeCustomizationPlugin(Star):
         else:
             refreshed = False
             try:
-                refreshed = await self._refresh_direct_record_source(bot, record, routing)
+                refreshed = await self._refresh_direct_record_source(bot, record, direct_routing)
             except Exception as e:
                 lines.append(f"原消息缓存刷新失败：{e}")
             if refreshed:
@@ -2605,7 +2627,7 @@ class WelcomeCustomizationPlugin(Star):
                         bot,
                         target,
                         record.get("nodes", []),
-                        routing,
+                        direct_routing,
                         str(event.get_group_id() or record.get("source_group_id") or ""),
                     )
                     lines.append(f"直转失败，但本地备份 {len(record.get('nodes', []))} 个节点发送成功。")
