@@ -22,6 +22,8 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 PLUGIN_NAME = "astrbot_plugin_customization"
 STORE_VERSION = 1
 SEND_STEPS = {"card", "record", "image", "text"}
+DEFAULT_SEND_ORDER = ["record", "card", "image", "text"]
+LEGACY_DEFAULT_SEND_ORDER = ["card", "record", "image", "text"]
 FORWARD_EXPAND_MAX_DEPTH = 6
 
 
@@ -39,7 +41,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "mode": "all",
     "whitelist_groups": [],
     "blacklist_groups": [],
-    "send_order": ["card", "record", "image", "text"],
+    "send_order": DEFAULT_SEND_ORDER,
     "send_interval_seconds": 1.5,
     "retry_enabled": True,
     "retry_count": 1,
@@ -214,11 +216,16 @@ class WelcomeCustomizationPlugin(Star):
         )
         for key in ("whitelist_groups", "blacklist_groups", "admin_qq_list"):
             normalized[key] = self._normalize_id_list(normalized.get(key, []))
-        normalized["send_order"] = [
+        send_order = [
             item
             for item in normalized.get("send_order", [])
             if item in SEND_STEPS
-        ] or ["card", "record", "image", "text"]
+        ]
+        normalized["send_order"] = (
+            DEFAULT_SEND_ORDER.copy()
+            if not send_order or send_order == LEGACY_DEFAULT_SEND_ORDER
+            else send_order
+        )
         normalized["text_content"] = str(normalized.get("text_content") or "")
         normalized["send_interval_seconds"] = self._bounded_float(
             normalized.get("send_interval_seconds"),
@@ -771,19 +778,13 @@ class WelcomeCustomizationPlugin(Star):
             if self._record_is_direct(record):
                 await self._send_direct_record(bot, user_id, record, routing, origin_group_id)
                 return
-            nodes = await self._prepare_record_nodes_for_send(
+            await self._send_record_nodes(
                 bot,
+                user_id,
                 record.get("nodes", []),
                 routing,
+                origin_group_id,
             )
-            params = {
-                "user_id": int(user_id),
-                "messages": [{"type": "node", "data": node} for node in nodes],
-                **routing,
-            }
-            if origin_group_id:
-                params["group_id"] = int(origin_group_id)
-            await bot.call_action("send_private_forward_msg", **params)
             return
         if step == "image":
             image = self._active_item("images", "active_image_id")
@@ -1024,7 +1025,7 @@ class WelcomeCustomizationPlugin(Star):
 
     def _record_has_content(self, record: dict[str, Any]) -> bool:
         if self._record_is_direct(record):
-            return bool(record.get("source_message_id"))
+            return bool(record.get("source_message_id") or record.get("nodes"))
         return bool(record.get("nodes"))
 
     @staticmethod
@@ -1039,30 +1040,226 @@ class WelcomeCustomizationPlugin(Star):
         routing: dict[str, Any],
         origin_group_id: str | None = None,
     ) -> None:
-        attempts = await self._try_direct_record_strategies(
-            bot,
-            user_id,
-            record,
-            routing,
-            origin_group_id,
-            stop_on_success=True,
-        )
+        try:
+            attempts = await self._try_direct_record_strategies(
+                bot,
+                user_id,
+                record,
+                routing,
+                origin_group_id,
+                stop_on_success=True,
+                trusted_only=True,
+            )
+        except Exception as e:
+            attempts = [{"strategy": "direct_source", "ok": False, "error": str(e)}]
         winner = next((item for item in attempts if item.get("ok")), None)
         if winner:
             strategy = winner.get("strategy", "")
-            if (
-                strategy
-                and self._trusted_direct_record_strategy(strategy)
-                and record.get("last_strategy") != strategy
-            ):
+            if strategy and self._trusted_direct_record_strategy(strategy):
                 record["last_strategy"] = strategy
+            record.pop("last_error", None)
+            record["last_success_at"] = int(time.time())
+            record["updated_at"] = int(time.time())
+            self._save()
+            return
+        refresh_error = ""
+        refreshed = False
+        try:
+            refreshed = await self._refresh_direct_record_source(bot, record, routing)
+        except Exception as e:
+            refresh_error = str(e)
+        if refreshed:
+            try:
+                retry_attempts = await self._try_direct_record_strategies(
+                    bot,
+                    user_id,
+                    record,
+                    routing,
+                    origin_group_id,
+                    stop_on_success=True,
+                    trusted_only=True,
+                )
+            except Exception as e:
+                retry_attempts = [{"strategy": "direct_source_retry", "ok": False, "error": str(e)}]
+            attempts.extend(retry_attempts)
+            winner = next((item for item in retry_attempts if item.get("ok")), None)
+            if winner:
+                strategy = winner.get("strategy", "")
+                if strategy and self._trusted_direct_record_strategy(strategy):
+                    record["last_strategy"] = strategy
+                record.pop("last_error", None)
+                record["last_success_at"] = int(time.time())
                 record["updated_at"] = int(time.time())
                 self._save()
-            return
+                return
+
+        fallback_nodes = record.get("nodes", [])
+        if fallback_nodes:
+            try:
+                await self._send_record_nodes(
+                    bot,
+                    user_id,
+                    fallback_nodes,
+                    routing,
+                    origin_group_id,
+                )
+                record["last_strategy"] = "local_backup_nodes"
+                record["last_backup_send_at"] = int(time.time())
+                record.pop("last_error", None)
+                record["updated_at"] = int(time.time())
+                await self._notify_direct_record_degraded(
+                    bot,
+                    record,
+                    user_id,
+                    origin_group_id,
+                    routing,
+                    attempts,
+                )
+                self._save()
+                return
+            except Exception as e:
+                attempts.append({"strategy": "local_backup_nodes", "ok": False, "error": str(e)})
         errors = "；".join(
             f"{item.get('strategy')}: {item.get('error')}" for item in attempts
         )
+        if refresh_error:
+            errors = f"{errors}；refresh_source: {refresh_error}" if errors else refresh_error
+        record["last_error"] = errors or "原消息直转失败"
+        record["last_failed_at"] = int(time.time())
+        record["updated_at"] = int(time.time())
+        self._save()
+        await self._notify_direct_record_failed(
+            bot,
+            record,
+            user_id,
+            origin_group_id,
+            routing,
+            errors or "原消息直转失败",
+        )
         raise RuntimeError(errors or "原消息直转失败")
+
+    async def _notify_direct_record_degraded(
+        self,
+        bot: Any,
+        record: dict[str, Any],
+        user_id: str,
+        origin_group_id: str | None,
+        routing: dict[str, Any],
+        attempts: list[dict[str, Any]],
+    ) -> None:
+        now = int(time.time())
+        last_notify = int(record.get("last_degraded_notify_at") or 0)
+        if now - last_notify < 86400:
+            return
+        record["last_degraded_notify_at"] = now
+        errors = "；".join(
+            f"{item.get('strategy')}: {item.get('error')}"
+            for item in attempts
+            if not item.get("ok")
+        )
+        await self._notify_admins(
+            bot,
+            "聊天记录直转已降级为本地备份发送\n"
+            f"素材：{record.get('name', record.get('id', ''))}\n"
+            f"目标 QQ：{user_id}\n"
+            f"来源群：{origin_group_id or record.get('source_group_id') or '-'}\n"
+            f"原消息：{record.get('source_message_id') or '-'}\n"
+            f"错误：{errors or '直转缓存不可用'}",
+            routing,
+            force_private=True,
+        )
+
+    async def _notify_direct_record_failed(
+        self,
+        bot: Any,
+        record: dict[str, Any],
+        user_id: str,
+        origin_group_id: str | None,
+        routing: dict[str, Any],
+        error: str,
+    ) -> None:
+        now = int(time.time())
+        last_notify = int(record.get("last_failed_notify_at") or 0)
+        if now - last_notify < 86400:
+            return
+        record["last_failed_notify_at"] = now
+        self._save()
+        await self._notify_admins(
+            bot,
+            "聊天记录直转发送失败\n"
+            f"素材：{record.get('name', record.get('id', ''))}\n"
+            f"目标 QQ：{user_id}\n"
+            f"来源群：{origin_group_id or record.get('source_group_id') or '-'}\n"
+            f"原消息：{record.get('source_message_id') or '-'}\n"
+            f"本地备份：{len(record.get('nodes') or [])} 个节点\n"
+            f"错误：{error}",
+            routing,
+            force_private=True,
+        )
+
+    async def _send_record_nodes(
+        self,
+        bot: Any,
+        user_id: str,
+        nodes: list[dict[str, Any]],
+        routing: dict[str, Any],
+        origin_group_id: str | None = None,
+    ) -> None:
+        prepared = await self._prepare_record_nodes_for_send(bot, nodes, routing)
+        params = {
+            "user_id": int(user_id),
+            "messages": [
+                {"type": "node", "data": self._node_for_send(node)}
+                for node in prepared
+            ],
+            **routing,
+        }
+        if origin_group_id:
+            params["group_id"] = int(origin_group_id)
+        await bot.call_action("send_private_forward_msg", **params)
+
+    def _node_for_send(self, node: dict[str, Any]) -> dict[str, Any]:
+        normalized = self._normalize_node_data(node)
+        return {
+            "user_id": normalized["user_id"],
+            "nickname": normalized["nickname"],
+            "content": normalized["content"],
+        }
+
+    async def _refresh_direct_record_source(
+        self,
+        bot: Any,
+        record: dict[str, Any],
+        routing: dict[str, Any],
+    ) -> bool:
+        source_message_id = str(record.get("source_message_id") or "").strip()
+        if not source_message_id:
+            return False
+        params = {**routing}
+        source_self_id = str(record.get("source_self_id") or "").strip()
+        if source_self_id:
+            params["self_id"] = source_self_id
+        ret = await bot.call_action("get_msg", message_id=int(source_message_id), **params)
+        message = ret.get("message", []) if isinstance(ret, dict) else []
+        forward_id = self._forward_id_from_raw(message)
+        changed = False
+        if forward_id and forward_id != str(record.get("source_forward_id") or ""):
+            record["source_forward_id"] = forward_id
+            changed = True
+        if isinstance(ret, dict):
+            group_id = str(ret.get("group_id") or "").strip()
+            user_id = str(ret.get("user_id") or "").strip()
+            if group_id and group_id != str(record.get("source_group_id") or ""):
+                record["source_group_id"] = group_id
+                changed = True
+            if user_id and user_id != str(record.get("source_user_id") or ""):
+                record["source_user_id"] = user_id
+                changed = True
+        record["last_refresh_at"] = int(time.time())
+        if changed:
+            record["updated_at"] = int(time.time())
+        self._save()
+        return bool(forward_id)
 
     async def _try_direct_record_strategies(
         self,
@@ -1072,6 +1269,7 @@ class WelcomeCustomizationPlugin(Star):
         routing: dict[str, Any],
         origin_group_id: str | None = None,
         stop_on_success: bool = False,
+        trusted_only: bool = False,
     ) -> list[dict[str, Any]]:
         source_message_id = str(record.get("source_message_id") or "").strip()
         if not source_message_id:
@@ -1089,6 +1287,12 @@ class WelcomeCustomizationPlugin(Star):
                 "forward_node_id_private_without_group",
             ],
         )
+        if trusted_only:
+            strategies = [
+                strategy
+                for strategy in strategies
+                if self._trusted_direct_record_strategy(strategy)
+            ]
         if self._trusted_direct_record_strategy(preferred) and preferred in strategies:
             strategies.remove(preferred)
             strategies.insert(0, preferred)
@@ -1238,9 +1442,10 @@ class WelcomeCustomizationPlugin(Star):
         bot: Any,
         message: str,
         routing: dict[str, Any],
+        force_private: bool = False,
     ) -> None:
         settings = self.store["settings"]
-        if settings.get("notify_admin_private"):
+        if force_private or settings.get("notify_admin_private"):
             for qq in settings.get("admin_qq_list", []):
                 try:
                     await self._send_private_payload(
@@ -1318,6 +1523,8 @@ class WelcomeCustomizationPlugin(Star):
             name = args[1] if len(args) > 1 else f"卡片{len(self.store['cards']) + 1}"
             raw_json = await self._extract_card_json(event)
             if not raw_json:
+                if await self._reply_has_record_reference(event):
+                    return "引用消息是聊天记录转发，不会作为 QQ JSON 卡片保存。请使用 /记录 添加 名称。"
                 return "没有在引用消息中找到 QQ JSON 卡片。请回复卡片消息后再执行。"
             card_id = uuid.uuid4().hex
             summary = self._summarize_card(raw_json)
@@ -1363,17 +1570,28 @@ class WelcomeCustomizationPlugin(Star):
                 "source_self_id",
                 "source_forward_id",
                 "last_strategy",
+                "last_error",
             ):
                 self.store["records"][record_id].pop(key, None)
+            self._set_record_capture_meta(
+                self.store["records"][record_id],
+                self.store["records"][record_id].get("nodes", []),
+            )
             self.store["records"][record_id]["updated_at"] = int(time.time())
             self.store["settings"]["active_record_id"] = record_id
             self._save()
-            return f"已保存 {len(nodes)} 个聊天记录节点到模板：{name}"
+            return self._record_save_message(name, nodes)
         if action in {"直转", "原转发", "direct", "raw"}:
             name = args[1] if len(args) > 1 else f"直转记录{len(self.store['records']) + 1}"
             source = await self._extract_direct_record_source(event)
             if not source:
                 return "没有找到可直转的引用消息。请回复原始聊天记录消息后执行 /记录 直转 名称。"
+            backup_nodes: list[dict[str, Any]] = []
+            backup_error = ""
+            try:
+                backup_nodes = await self._extract_record_nodes(event)
+            except Exception as e:
+                backup_error = str(e)
             record_id = self._find_material_id_by_name("records", name)
             if not record_id:
                 record_id = uuid.uuid4().hex
@@ -1385,15 +1603,21 @@ class WelcomeCustomizationPlugin(Star):
             self.store["records"][record_id].update(
                 {
                     "mode": "direct_forward",
-                    "nodes": [],
+                    "nodes": backup_nodes,
+                    "backup_error": backup_error,
+                    "backup_captured_at": int(time.time()) if backup_nodes else 0,
                     "updated_at": int(time.time()),
                     **source,
                 },
             )
+            self._set_record_capture_meta(self.store["records"][record_id], backup_nodes)
             self.store["settings"]["active_record_id"] = record_id
             self._save()
+            backup_note = f"，已同时保存本地备份 {len(backup_nodes)} 个节点" if backup_nodes else "，未能保存本地备份"
+            if backup_error and not backup_nodes:
+                backup_note += f"：{backup_error}"
             return (
-                f"已保存并启用原消息直转记录：{name}\n"
+                f"已保存并启用原消息直转记录：{name}{backup_note}\n"
                 "建议立即执行 /记录 探测 "
                 f"{name} QQ号，确认当前 NapCat 能否原样转发嵌套聊天记录。"
             )
@@ -1612,12 +1836,38 @@ class WelcomeCustomizationPlugin(Star):
         raw_segments = await self._raw_reply_segments(event)
         for segment in raw_segments:
             if segment.get("type") == "json":
-                return self._json_segment_to_raw(segment.get("data", {}).get("data"))
+                value = segment.get("data", {}).get("data")
+                if self._looks_like_forward_json_payload(value):
+                    continue
+                return self._json_segment_to_raw(value)
 
         for component in self._reply_chain(event):
-            if isinstance(component, Json):
+            if isinstance(component, Json) and not self._looks_like_forward_json_payload(
+                component.data,
+            ):
                 return self._json_segment_to_raw(component.data)
         return ""
+
+    async def _reply_has_forward_json_card(self, event: AstrMessageEvent) -> bool:
+        raw_segments = await self._raw_reply_segments(event)
+        for segment in raw_segments:
+            if segment.get("type") == "json" and self._looks_like_forward_json_payload(
+                segment.get("data", {}).get("data"),
+            ):
+                return True
+        return any(
+            isinstance(component, Json)
+            and self._looks_like_forward_json_payload(component.data)
+            for component in self._reply_chain(event)
+        )
+
+    async def _reply_has_record_reference(self, event: AstrMessageEvent) -> bool:
+        raw_segments = await self._raw_reply_segments(event)
+        if any(self._forward_id_from_segment(segment) for segment in raw_segments):
+            return True
+        if await self._reply_has_forward_json_card(event):
+            return True
+        return any(isinstance(component, Forward) for component in self._reply_chain(event))
 
     @staticmethod
     def _json_segment_to_raw(value: Any) -> str:
@@ -1626,6 +1876,11 @@ class WelcomeCustomizationPlugin(Star):
         if isinstance(value, dict) and isinstance(value.get("data"), str):
             return value["data"]
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _looks_like_forward_json_payload(value: Any) -> bool:
+        data = WelcomeCustomizationPlugin._parse_json_card_payload(value)
+        return WelcomeCustomizationPlugin._looks_like_forward_json_card(data)
 
     async def _extract_image_source(self, event: AstrMessageEvent) -> str:
         raw_segments = await self._raw_reply_segments(event)
@@ -1654,6 +1909,78 @@ class WelcomeCustomizationPlugin(Star):
                 "content": content,
             },
         ]
+
+    def _set_record_capture_meta(
+        self,
+        record: dict[str, Any],
+        nodes: list[dict[str, Any]],
+    ) -> None:
+        external_ids = self._record_external_forward_ids(nodes)
+        source_ids, max_depth = self._record_source_meta(nodes)
+        record["node_count"] = len(nodes)
+        record["capture_depth_limit"] = FORWARD_EXPAND_MAX_DEPTH
+        record["source_forward_ids"] = source_ids
+        record["max_captured_depth"] = max_depth
+        record["external_forward_ids"] = external_ids
+        record["capture_mode"] = (
+            "partial_external" if external_ids else "complete_local"
+        ) if nodes else "empty"
+        record["captured_at"] = int(time.time())
+
+    def _record_save_message(self, name: str, nodes: list[dict[str, Any]]) -> str:
+        external_ids = self._record_external_forward_ids(nodes)
+        message = f"已保存 {len(nodes)} 个聊天记录节点到模板：{name}"
+        if external_ids:
+            message += (
+                f"\n其中 {len(external_ids)} 个内层转发仍依赖协议端缓存；"
+                "发送时会继续尝试展开，失效时请重新引用原消息采集。"
+            )
+        else:
+            message += "\n已尽量展开并本地保存嵌套聊天记录内容。"
+        return message
+
+    def _record_external_forward_ids(self, nodes: list[dict[str, Any]]) -> list[str]:
+        ret: list[str] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                forward_id = self._forward_id_from_segment(value)
+                if forward_id and forward_id not in ret:
+                    ret.append(forward_id)
+                for item in value.values():
+                    visit(item)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+
+        visit(nodes)
+        return ret
+
+    @staticmethod
+    def _record_source_meta(nodes: list[dict[str, Any]]) -> tuple[list[str], int]:
+        source_ids: list[str] = []
+        max_depth = 0
+
+        def visit(value: Any) -> None:
+            nonlocal max_depth
+            if isinstance(value, dict):
+                meta = value.get("_record_meta")
+                if isinstance(meta, dict):
+                    source_id = str(meta.get("source_forward_id") or "")
+                    if source_id and source_id not in source_ids:
+                        source_ids.append(source_id)
+                    try:
+                        max_depth = max(max_depth, int(meta.get("depth") or 0))
+                    except (TypeError, ValueError):
+                        pass
+                for item in value.values():
+                    visit(item)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+
+        visit(nodes)
+        return source_ids, max_depth
 
     async def _extract_direct_record_source(
         self,
@@ -1725,14 +2052,17 @@ class WelcomeCustomizationPlugin(Star):
         routing = {}
         if hasattr(raw, "get") and raw.get("self_id"):
             routing["self_id"] = raw.get("self_id")
-        results = await self._try_direct_record_strategies(
-            bot,
-            target,
-            record,
-            routing,
-            str(event.get_group_id() or record.get("source_group_id") or ""),
-            stop_on_success=True,
-        )
+        try:
+            results = await self._try_direct_record_strategies(
+                bot,
+                target,
+                record,
+                routing,
+                str(event.get_group_id() or record.get("source_group_id") or ""),
+                stop_on_success=True,
+            )
+        except Exception as e:
+            results = [{"strategy": "direct_source", "ok": False, "error": str(e)}]
         winner = next((item for item in results if item.get("ok")), None)
         trusted_winner = None
         if winner:
@@ -1759,7 +2089,27 @@ class WelcomeCustomizationPlugin(Star):
                 "请以接收端实际展开结果为准，插件不会把它记为优先策略。",
             )
         else:
-            lines.append("没有策略成功。若原消息已过期或不在当前 NapCat 消息缓存中，需要重新引用最近的原始消息再采集。")
+            refreshed = False
+            try:
+                refreshed = await self._refresh_direct_record_source(bot, record, routing)
+            except Exception as e:
+                lines.append(f"原消息缓存刷新失败：{e}")
+            if refreshed:
+                lines.append("已从 QQ 上下文重新读取原消息信息，可再次执行探测确认直转。")
+            if record.get("nodes"):
+                try:
+                    await self._send_record_nodes(
+                        bot,
+                        target,
+                        record.get("nodes", []),
+                        routing,
+                        str(event.get_group_id() or record.get("source_group_id") or ""),
+                    )
+                    lines.append(f"直转失败，但本地备份 {len(record.get('nodes', []))} 个节点发送成功。")
+                except Exception as e:
+                    lines.append(f"本地备份发送也失败：{e}")
+            else:
+                lines.append("没有策略成功，且该直转素材没有本地备份。需要重新引用原始聊天记录再采集。")
         return "\n".join(lines)
 
     async def _reply_snapshot(self, event: AstrMessageEvent) -> dict[str, Any] | None:
@@ -1828,29 +2178,54 @@ class WelcomeCustomizationPlugin(Star):
         depth: int = 0,
         seen: set[str] | None = None,
         unresolved: list[str] | None = None,
+        parent_forward_id: str = "",
     ) -> list[dict[str, Any]]:
-        owns_unresolved = unresolved is None
         unresolved = unresolved if unresolved is not None else []
         if depth >= FORWARD_EXPAND_MAX_DEPTH:
             logger.warning("合并转发嵌套层级过深，停止展开：%s", forward_id)
-            unresolved.append(forward_id)
+            if forward_id not in unresolved:
+                unresolved.append(forward_id)
             return []
-        seen = set(seen or ())
+        seen = seen if seen is not None else set()
         if forward_id in seen:
             logger.warning("合并转发出现循环引用，停止展开：%s", forward_id)
-            unresolved.append(forward_id)
+            if forward_id not in unresolved:
+                unresolved.append(forward_id)
             return []
         seen.add(forward_id)
-        ret = await bot.call_action("get_forward_msg", id=forward_id, **routing)
-        messages = self._extract_forward_messages(ret)
-        nodes: list[dict[str, Any]] = []
-        for item in messages:
-            node = self._forward_message_to_node(item)
-            if node:
-                nodes.append(node)
-        if owns_unresolved and unresolved:
-            raise ForwardExpandError(unresolved)
-        return nodes
+        try:
+            try:
+                ret = await bot.call_action("get_forward_msg", id=forward_id, **routing)
+            except Exception:
+                logger.exception("读取合并转发消息失败：%s", forward_id)
+                if forward_id not in unresolved:
+                    unresolved.append(forward_id)
+                return []
+            messages = self._extract_forward_messages(ret)
+            nodes: list[dict[str, Any]] = []
+            for item in messages:
+                node = self._forward_message_to_node(item)
+                if node:
+                    self._attach_record_node_meta(
+                        node,
+                        forward_id,
+                        parent_forward_id,
+                        depth,
+                    )
+                    nodes.extend(
+                        await self._expand_record_node(
+                            bot,
+                            node,
+                            routing,
+                            depth,
+                            seen,
+                            unresolved,
+                            forward_id,
+                        ),
+                    )
+            return nodes
+        finally:
+            seen.discard(forward_id)
 
     async def _prepare_record_nodes_for_send(
         self,
@@ -1870,11 +2245,25 @@ class WelcomeCustomizationPlugin(Star):
                     0,
                     seen,
                     unresolved,
+                    "",
                 ),
             )
         if not prepared:
             raise ValueError("聊天记录内容为空")
         return prepared
+
+    @staticmethod
+    def _attach_record_node_meta(
+        node: dict[str, Any],
+        forward_id: str,
+        parent_forward_id: str,
+        depth: int,
+    ) -> None:
+        node["_record_meta"] = {
+            "source_forward_id": forward_id,
+            "parent_forward_id": parent_forward_id,
+            "depth": depth,
+        }
 
     async def _expand_record_node(
         self,
@@ -1884,10 +2273,13 @@ class WelcomeCustomizationPlugin(Star):
         depth: int,
         seen: set[str],
         unresolved: list[str],
+        current_forward_id: str,
     ) -> list[dict[str, Any]]:
         if not node:
             return []
         normalized = self._normalize_node_data(node)
+        if isinstance(node.get("_record_meta"), dict):
+            normalized["_record_meta"] = dict(node["_record_meta"])
         content, nested_nodes = await self._expand_forward_segments(
             bot,
             normalized.get("content", []),
@@ -1895,6 +2287,7 @@ class WelcomeCustomizationPlugin(Star):
             depth,
             seen,
             unresolved,
+            current_forward_id,
         )
         result: list[dict[str, Any]] = []
         if content:
@@ -1911,6 +2304,7 @@ class WelcomeCustomizationPlugin(Star):
         depth: int,
         seen: set[str],
         unresolved: list[str],
+        current_forward_id: str,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         content: list[dict[str, Any]] = []
         nested_nodes: list[dict[str, Any]] = []
@@ -1918,20 +2312,41 @@ class WelcomeCustomizationPlugin(Star):
             embedded_nodes = self._embedded_forward_nodes_from_segment(segment)
             if embedded_nodes:
                 for node in embedded_nodes:
+                    child_node = self._forward_message_to_node(node)
+                    if child_node:
+                        self._attach_record_node_meta(
+                            child_node,
+                            current_forward_id or "embedded_forward_nodes",
+                            current_forward_id,
+                            depth + 1,
+                        )
                     nested_nodes.extend(
                         await self._expand_record_node(
                             bot,
-                            self._forward_message_to_node(node),
+                            child_node,
                             routing,
                             depth + 1,
                             seen,
                             unresolved,
+                            current_forward_id,
                         ),
                     )
                 continue
             forward_id = self._forward_id_from_segment(segment)
             if not forward_id:
                 content.append(segment)
+                continue
+            nested = await self._fetch_forward_nodes(
+                bot,
+                forward_id,
+                routing,
+                depth + 1,
+                seen,
+                unresolved,
+                current_forward_id,
+            )
+            if nested:
+                nested_nodes.extend(nested)
                 continue
             content.append({"type": "forward", "data": {"id": forward_id}})
         return content, nested_nodes

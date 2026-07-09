@@ -157,7 +157,7 @@ function renderOrder(order) {
   const root = $("order");
   root.innerHTML = "";
   const selected = new Set(order || []);
-  for (const step of ["card", "record", "image", "text"]) {
+  for (const step of ["record", "card", "image", "text"]) {
     const row = document.createElement("label");
     row.className = "order-row";
     row.innerHTML = `
@@ -216,20 +216,35 @@ function previewFor(item, kind) {
     return `<p class="muted">${escapeHtml(item.kind === "local" ? "本地上传图片" : item.source || "")}</p>`;
   }
   if (kind === "record" && item.mode === "direct_forward") {
+    const backupCount = item.nodes?.length || 0;
+    const backupText = backupCount ? `本地备份 ${backupCount} 个节点` : "没有本地备份";
+    const staleText = item.external_forward_ids?.length
+      ? ` · ${item.external_forward_ids.length} 个外部引用`
+      : "";
     return `
-      <p class="muted">原消息直转，发送时由 NapCat 按原消息位置转发。</p>
+      <p class="muted">原消息直转，失败时尝试刷新原消息缓存并使用${escapeHtml(backupText)}。</p>
       <p class="muted">消息 ${escapeHtml(item.source_message_id || "-")} · 来源群 ${escapeHtml(item.source_group_id || "-")}</p>
-      <p class="muted">优先策略 ${escapeHtml(item.last_strategy || "未探测")}</p>
+      <p class="muted">优先策略 ${escapeHtml(item.last_strategy || "未探测")}${escapeHtml(staleText)}</p>
     `;
   }
-  return `<p class="muted">发送时使用 OneBot 合并转发消息</p>`;
+  const externalCount = item.external_forward_ids?.length || 0;
+  const modeText = item.capture_mode === "complete_local"
+    ? "已本地化保存嵌套内容"
+    : externalCount
+      ? `仍有 ${externalCount} 个外部引用`
+      : "发送时使用 OneBot 合并转发消息";
+  return `<p class="muted">${escapeHtml(modeText)}</p>`;
 }
 
 function recordMeta(item) {
   if (item.mode === "direct_forward") {
-    return "原消息直转";
+    const backupCount = item.nodes?.length || 0;
+    return backupCount ? `原消息直转 · 备份 ${backupCount} 节点` : "原消息直转 · 无备份";
   }
-  return `${item.nodes?.length || 0} 个节点`;
+  const externalCount = item.external_forward_ids?.length || 0;
+  return externalCount
+    ? `${item.nodes?.length || 0} 个节点 · ${externalCount} 外部引用`
+    : `${item.nodes?.length || 0} 个节点 · 本地化`;
 }
 
 function renderLogs(logs) {
