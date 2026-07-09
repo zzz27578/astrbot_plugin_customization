@@ -25,6 +25,7 @@ SEND_STEPS = {"card", "record", "image", "text"}
 DEFAULT_SEND_ORDER = ["record", "card", "image", "text"]
 LEGACY_DEFAULT_SEND_ORDER = ["card", "record", "image", "text"]
 FORWARD_EXPAND_MAX_DEPTH = 6
+DAILY_TEST_POLL_SECONDS = 30
 
 
 class ForwardExpandError(RuntimeError):
@@ -72,6 +73,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "active_record_id": "",
     "active_image_id": "",
     "test_receiver_qq": "",
+    "daily_test_enabled": False,
+    "daily_test_receiver_qq": "",
+    "daily_test_time": "09:00",
+    "daily_test_last_date": "",
     "max_logs": 100,
 }
 
@@ -99,6 +104,7 @@ class WelcomeCustomizationPlugin(Star):
         self.store: dict[str, Any] = self._load_store()
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.worker_task: asyncio.Task | None = None
+        self.daily_test_task: asyncio.Task | None = None
 
         context.register_web_api(
             f"/{PLUGIN_NAME}/state",
@@ -157,12 +163,19 @@ class WelcomeCustomizationPlugin(Star):
 
     async def initialize(self) -> None:
         self._ensure_worker()
+        self._ensure_daily_test_task()
 
     async def terminate(self) -> None:
         if self.worker_task and not self.worker_task.done():
             self.worker_task.cancel()
             try:
                 await self.worker_task
+            except asyncio.CancelledError:
+                pass
+        if self.daily_test_task and not self.daily_test_task.done():
+            self.daily_test_task.cancel()
+            try:
+                await self.daily_test_task
             except asyncio.CancelledError:
                 pass
 
@@ -275,6 +288,20 @@ class WelcomeCustomizationPlugin(Star):
             500,
             100,
         )
+        normalized["test_receiver_qq"] = str(
+            normalized.get("test_receiver_qq") or "",
+        ).strip()
+        normalized["daily_test_enabled"] = bool(normalized.get("daily_test_enabled"))
+        normalized["daily_test_receiver_qq"] = str(
+            normalized.get("daily_test_receiver_qq") or "",
+        ).strip()
+        normalized["daily_test_time"] = self._normalize_time_hhmm(
+            normalized.get("daily_test_time"),
+            "09:00",
+        )
+        normalized["daily_test_last_date"] = str(
+            normalized.get("daily_test_last_date") or "",
+        ).strip()
         return normalized
 
     @staticmethod
@@ -311,6 +338,144 @@ class WelcomeCustomizationPlugin(Star):
             return fallback
         return max(minimum, min(maximum, ret))
 
+    async def _prepare_record_node_for_send(
+        self,
+        bot: Any,
+        node: dict[str, Any] | None,
+        routing: dict[str, Any],
+        depth: int,
+        seen: set[str],
+        unresolved: list[str],
+    ) -> dict[str, Any] | None:
+        if not node:
+            return None
+        normalized = self._normalize_node_data(node)
+        normalized["content"] = await self._prepare_record_segments_for_send(
+            bot,
+            normalized.get("content", []),
+            routing,
+            depth,
+            seen,
+            unresolved,
+        )
+        return normalized
+
+    async def _prepare_record_segments_for_send(
+        self,
+        bot: Any,
+        segments: list[dict[str, Any]],
+        routing: dict[str, Any],
+        depth: int,
+        seen: set[str],
+        unresolved: list[str],
+    ) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = []
+        for segment in self._normalize_raw_segments(segments):
+            data = segment.get("data") if isinstance(segment, dict) else None
+            nested_nodes = data.get("_nested_nodes") if isinstance(data, dict) else None
+            if segment.get("type") == "forward" and isinstance(nested_nodes, list):
+                nested_segment = await self._nodes_to_nested_node_segment(
+                    bot,
+                    nested_nodes,
+                    routing,
+                    depth + 1,
+                    seen,
+                    unresolved,
+                )
+                if nested_segment:
+                    content.append(nested_segment)
+                    continue
+
+            forward_id = self._forward_id_from_segment(segment)
+            if segment.get("type") == "forward" and forward_id:
+                refreshed = await self._forward_segment_with_nested_backup(
+                    bot,
+                    forward_id,
+                    routing,
+                    depth,
+                    seen,
+                    unresolved,
+                )
+                content.append(refreshed or {"type": "forward", "data": {"id": forward_id}})
+                continue
+
+            content.append(self._strip_internal_segment_fields(segment))
+        return content
+
+    async def _nodes_to_nested_node_segment(
+        self,
+        bot: Any,
+        nodes: list[dict[str, Any]],
+        routing: dict[str, Any],
+        depth: int,
+        seen: set[str],
+        unresolved: list[str],
+    ) -> dict[str, Any] | None:
+        prepared: list[dict[str, Any]] = []
+        for node in nodes:
+            prepared_node = await self._prepare_record_node_for_send(
+                bot,
+                deepcopy(node),
+                routing,
+                depth,
+                seen,
+                unresolved,
+            )
+            if prepared_node and prepared_node.get("content"):
+                prepared.append(prepared_node)
+        if not prepared:
+            return None
+        return {
+            "type": "node",
+            "data": {
+                "content": [
+                    {"type": "node", "data": self._node_for_send(child)}
+                    for child in prepared
+                ],
+            },
+        }
+
+    async def _forward_segment_with_nested_backup(
+        self,
+        bot: Any,
+        forward_id: str,
+        routing: dict[str, Any],
+        depth: int,
+        seen: set[str],
+        unresolved: list[str],
+    ) -> dict[str, Any] | None:
+        nested = await self._fetch_forward_nodes(
+            bot,
+            forward_id,
+            routing,
+            depth + 1,
+            seen,
+            unresolved,
+            "",
+        )
+        if not nested:
+            return None
+        return await self._nodes_to_nested_node_segment(
+            bot,
+            nested,
+            routing,
+            depth + 1,
+            seen,
+            unresolved,
+        )
+
+    @staticmethod
+    def _normalize_time_hhmm(value: Any, fallback: str) -> str:
+        text = str(value or "").strip()
+        match = re.fullmatch(r"(\d{1,2}):(\d{1,2})", text)
+        if not match:
+            return fallback
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if hour > 23 or minute > 59:
+            return fallback
+        return f"{hour:02d}:{minute:02d}"
+
     def _save(self) -> None:
         self.store["settings"] = self._normalize_settings(self.store["settings"])
         max_logs = self.store["settings"]["max_logs"]
@@ -332,6 +497,57 @@ class WelcomeCustomizationPlugin(Star):
                 logger.exception("欢迎私聊队列任务执行失败。")
             finally:
                 self.queue.task_done()
+
+    def _ensure_daily_test_task(self) -> None:
+        if self.daily_test_task is None or self.daily_test_task.done():
+            self.daily_test_task = asyncio.create_task(self._daily_test_worker())
+
+    async def _daily_test_worker(self) -> None:
+        while True:
+            try:
+                await self._run_daily_test_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Daily welcome test delivery failed.")
+            await asyncio.sleep(DAILY_TEST_POLL_SECONDS)
+
+    async def _run_daily_test_once(self) -> None:
+        settings = self.store["settings"]
+        if not settings.get("daily_test_enabled"):
+            return
+        target = str(settings.get("daily_test_receiver_qq") or "").strip()
+        if not target:
+            return
+        today = time.strftime("%Y-%m-%d")
+        if str(settings.get("daily_test_last_date") or "") == today:
+            return
+        if time.strftime("%H:%M") != str(settings.get("daily_test_time") or "09:00"):
+            return
+
+        settings["daily_test_last_date"] = today
+        self._save()
+        bot = self._get_aiocqhttp_bot()
+        if bot is None:
+            self._append_log(
+                "failed",
+                "daily-test",
+                target,
+                "daily_test",
+                "aiocqhttp platform is not online",
+            )
+            return
+
+        summary = await self._send_current_config_to_target(bot, target, {})
+        failed = summary["failed"]
+        self._append_log(
+            "failed" if failed else "success",
+            "daily-test",
+            target,
+            "daily_test",
+            "; ".join(item["error"] for item in failed),
+            summary["results"],
+        )
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def on_any_event(self, event: AstrMessageEvent):
@@ -1011,14 +1227,51 @@ class WelcomeCustomizationPlugin(Star):
         routing: dict[str, Any],
         origin_group_id: str | None = None,
     ) -> None:
-        params = {
+        await self._call_send_attempts(
+            bot,
+            self._private_payload_attempts(user_id, payload, routing, origin_group_id),
+        )
+
+    def _private_payload_attempts(
+        self,
+        user_id: str,
+        payload: list[dict[str, Any]],
+        routing: dict[str, Any],
+        origin_group_id: str | None = None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        base = {
             "user_id": int(user_id),
             "message": payload,
             **routing,
         }
-        if origin_group_id:
-            params["group_id"] = int(origin_group_id)
-        await bot.call_action("send_private_msg", **params)
+        if not origin_group_id:
+            return [("send_private_msg", base)]
+        group_id = int(origin_group_id)
+        return [
+            (
+                "send_msg",
+                {
+                    **base,
+                    "message_type": "private",
+                    "sub_type": "group",
+                    "group_id": group_id,
+                },
+            ),
+            ("send_private_msg", {**base, "group_id": group_id}),
+        ]
+
+    async def _call_send_attempts(
+        self,
+        bot: Any,
+        attempts: list[tuple[str, dict[str, Any]]],
+    ) -> Any:
+        errors: list[str] = []
+        for action, params in attempts:
+            try:
+                return await bot.call_action(action, **params)
+            except Exception as e:
+                errors.append(f"{action}: {e}")
+        raise RuntimeError("; ".join(errors))
 
     def _record_is_direct(self, record: dict[str, Any]) -> bool:
         return str(record.get("mode") or "") == "direct_forward"
@@ -1030,7 +1283,7 @@ class WelcomeCustomizationPlugin(Star):
 
     @staticmethod
     def _trusted_direct_record_strategy(strategy: str) -> bool:
-        return strategy in {"forward_friend_single_msg", "forward_segment_private"}
+        return strategy in {"forward_segment_private", "forward_node_id_private"}
 
     async def _send_direct_record(
         self,
@@ -1214,17 +1467,62 @@ class WelcomeCustomizationPlugin(Star):
             ],
             **routing,
         }
-        if origin_group_id:
-            params["group_id"] = int(origin_group_id)
-        await bot.call_action("send_private_forward_msg", **params)
+        await self._call_send_attempts(
+            bot,
+            self._private_forward_attempts(params, origin_group_id),
+        )
+
+    def _private_forward_attempts(
+        self,
+        params: dict[str, Any],
+        origin_group_id: str | None = None,
+    ) -> list[tuple[str, dict[str, Any]]]:
+        if not origin_group_id:
+            return [("send_private_forward_msg", params)]
+        group_id = int(origin_group_id)
+        with_group = {**params, "group_id": group_id}
+        return [
+            (
+                "send_forward_msg",
+                {
+                    **with_group,
+                    "message_type": "private",
+                    "message": with_group.get("messages", []),
+                },
+            ),
+            ("send_private_forward_msg", with_group),
+            (
+                "send_msg",
+                {
+                    **with_group,
+                    "message_type": "private",
+                    "message": with_group.get("messages", []),
+                },
+            ),
+        ]
 
     def _node_for_send(self, node: dict[str, Any]) -> dict[str, Any]:
         normalized = self._normalize_node_data(node)
         return {
             "user_id": normalized["user_id"],
             "nickname": normalized["nickname"],
-            "content": normalized["content"],
+            "content": [
+                self._strip_internal_segment_fields(segment)
+                for segment in normalized["content"]
+            ],
         }
+
+    @staticmethod
+    def _strip_internal_segment_fields(segment: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(segment, dict):
+            return segment
+        cleaned = deepcopy(segment)
+        data = cleaned.get("data")
+        if isinstance(data, dict):
+            data.pop("_nested_nodes", None)
+            data.pop("_source_forward_id", None)
+        cleaned.pop("_record_meta", None)
+        return cleaned
 
     async def _refresh_direct_record_source(
         self,
@@ -1278,15 +1576,19 @@ class WelcomeCustomizationPlugin(Star):
         source_forward_id = str(record.get("source_forward_id") or "").strip()
         target_group_id = str(origin_group_id or source_group_id or "").strip()
         preferred = str(record.get("last_strategy") or "").strip()
-        strategies = ["forward_friend_single_msg"]
+        strategies: list[str] = []
         if source_forward_id:
             strategies.append("forward_segment_private")
-        strategies.extend(
-            [
-                "forward_node_id_private",
-                "forward_node_id_private_without_group",
-            ],
-        )
+        strategies.append("forward_node_id_private")
+        if target_group_id:
+            strategies.append("forward_node_id_private_without_group")
+        else:
+            strategies.extend(
+                [
+                    "forward_node_id_private_without_group",
+                    "forward_friend_single_msg",
+                ],
+            )
         if trusted_only:
             strategies = [
                 strategy
@@ -1335,9 +1637,10 @@ class WelcomeCustomizationPlugin(Star):
                 ],
                 **routing,
             }
-            if target_group_id:
-                params["group_id"] = int(target_group_id)
-            await bot.call_action("send_private_forward_msg", **params)
+            await self._call_send_attempts(
+                bot,
+                self._private_forward_attempts(params, target_group_id or None),
+            )
             return
         if strategy == "forward_node_id_private_without_group":
             await bot.call_action(
@@ -1778,19 +2081,48 @@ class WelcomeCustomizationPlugin(Star):
         raw = getattr(event.message_obj, "raw_message", None)
         if hasattr(raw, "get") and raw.get("self_id"):
             routing["self_id"] = raw.get("self_id")
+        origin_group_id = str(event.get_group_id() or "").strip()
+        summary = await self._send_current_config_to_target(
+            bot,
+            target,
+            routing,
+            origin_group_id or None,
+        )
+        failed = summary["failed"]
+        if failed:
+            return "测试发送失败：" + "；".join(item["error"] for item in failed)
+        sent_count = summary["sent_count"]
+        if sent_count <= 0:
+            return "当前没有可发送项，已跳过测试发送。"
+        return f"已向 {target} 发送当前配置，共 {sent_count} 项。"
+
+    async def _send_current_config_to_target(
+        self,
+        bot: Any,
+        target: str,
+        routing: dict[str, Any],
+        origin_group_id: str | None = None,
+    ) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
         for step in self.store["settings"]["send_order"]:
-            result = await self._send_step_with_retry(bot, target, step, routing)
+            result = await self._send_step_with_retry(
+                bot,
+                target,
+                step,
+                routing,
+                origin_group_id,
+            )
             results.append(result)
             if not result.get("skipped"):
                 await asyncio.sleep(float(self.store["settings"]["send_interval_seconds"]))
         failed = [item for item in results if not item["ok"]]
-        if failed:
-            return "测试发送失败：" + "；".join(item["error"] for item in failed)
         sent_count = len([item for item in results if not item.get("skipped")])
-        if sent_count <= 0:
-            return "当前没有可发送项，已跳过测试发送。"
-        return f"已向 {target} 发送当前配置，共 {sent_count} 项。"
+        return {
+            "results": results,
+            "failed": failed,
+            "sent_count": sent_count,
+            "skipped_count": len(results) - sent_count,
+        }
 
     def _status_text(self) -> str:
         settings = self.store["settings"]
@@ -1944,8 +2276,10 @@ class WelcomeCustomizationPlugin(Star):
 
         def visit(value: Any) -> None:
             if isinstance(value, dict):
+                data = value.get("data") if isinstance(value.get("data"), dict) else {}
+                has_local_nested_backup = isinstance(data.get("_nested_nodes"), list)
                 forward_id = self._forward_id_from_segment(value)
-                if forward_id and forward_id not in ret:
+                if forward_id and not has_local_nested_backup and forward_id not in ret:
                     ret.append(forward_id)
                 for item in value.values():
                     visit(item)
@@ -2237,17 +2571,16 @@ class WelcomeCustomizationPlugin(Star):
         seen: set[str] = set()
         unresolved: list[str] = []
         for node in nodes:
-            prepared.extend(
-                await self._expand_record_node(
-                    bot,
-                    deepcopy(node),
-                    routing,
-                    0,
-                    seen,
-                    unresolved,
-                    "",
-                ),
+            prepared_node = await self._prepare_record_node_for_send(
+                bot,
+                deepcopy(node),
+                routing,
+                0,
+                seen,
+                unresolved,
             )
+            if prepared_node and prepared_node.get("content"):
+                prepared.append(prepared_node)
         if not prepared:
             raise ValueError("聊天记录内容为空")
         return prepared
@@ -2293,7 +2626,6 @@ class WelcomeCustomizationPlugin(Star):
         if content:
             normalized["content"] = content
             result.append(normalized)
-        result.extend(nested_nodes)
         return result
 
     async def _expand_forward_segments(
@@ -2311,6 +2643,7 @@ class WelcomeCustomizationPlugin(Star):
         for segment in self._normalize_raw_segments(segments):
             embedded_nodes = self._embedded_forward_nodes_from_segment(segment)
             if embedded_nodes:
+                children: list[dict[str, Any]] = []
                 for node in embedded_nodes:
                     child_node = self._forward_message_to_node(node)
                     if child_node:
@@ -2320,7 +2653,7 @@ class WelcomeCustomizationPlugin(Star):
                             current_forward_id,
                             depth + 1,
                         )
-                    nested_nodes.extend(
+                    children.extend(
                         await self._expand_record_node(
                             bot,
                             child_node,
@@ -2330,6 +2663,17 @@ class WelcomeCustomizationPlugin(Star):
                             unresolved,
                             current_forward_id,
                         ),
+                    )
+                if children:
+                    content.append(
+                        {
+                            "type": "forward",
+                            "data": {
+                                "_nested_nodes": children,
+                                "_source_forward_id": current_forward_id
+                                or "embedded_forward_nodes",
+                            },
+                        },
                     )
                 continue
             forward_id = self._forward_id_from_segment(segment)
@@ -2346,7 +2690,16 @@ class WelcomeCustomizationPlugin(Star):
                 current_forward_id,
             )
             if nested:
-                nested_nodes.extend(nested)
+                content.append(
+                    {
+                        "type": "forward",
+                        "data": {
+                            "id": forward_id,
+                            "_nested_nodes": nested,
+                            "_source_forward_id": forward_id,
+                        },
+                    },
+                )
                 continue
             content.append({"type": "forward", "data": {"id": forward_id}})
         return content, nested_nodes
@@ -2818,25 +3171,19 @@ class WelcomeCustomizationPlugin(Star):
         bot = self._get_aiocqhttp_bot()
         if bot is None:
             return error_response("aiocqhttp platform is not online", status_code=503)
-        results: list[dict[str, Any]] = []
-        for step in self.store["settings"]["send_order"]:
-            result = await self._send_step_with_retry(bot, target, step, {})
-            results.append(result)
-            if not result.get("skipped"):
-                await asyncio.sleep(float(self.store["settings"]["send_interval_seconds"]))
-        failed = [item for item in results if not item["ok"]]
+        summary = await self._send_current_config_to_target(bot, target, {})
+        failed = summary["failed"]
         if failed:
             return error_response(
                 "；".join(item["error"] for item in failed),
                 status_code=500,
             )
-        sent_count = len([item for item in results if not item.get("skipped")])
         return json_response(
             {
-                "sent": sent_count > 0,
-                "sent_count": sent_count,
-                "skipped_count": len(results) - sent_count,
-                "results": results,
+                "sent": summary["sent_count"] > 0,
+                "sent_count": summary["sent_count"],
+                "skipped_count": summary["skipped_count"],
+                "results": summary["results"],
             },
         )
 

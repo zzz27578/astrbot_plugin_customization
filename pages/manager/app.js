@@ -14,6 +14,8 @@ const orderLabels = {
   text: "文字",
 };
 
+const defaultOrder = ["record", "card", "image", "text"];
+
 let state = null;
 
 await bridge.ready();
@@ -90,6 +92,9 @@ function render() {
   setValue("notifyOnSuccess", settings.notify_on_success);
   setValue("maxLogs", settings.max_logs);
   setValue("testReceiver", settings.test_receiver_qq);
+  setValue("dailyTestEnabled", settings.daily_test_enabled);
+  setValue("dailyTestReceiver", settings.daily_test_receiver_qq);
+  setValue("dailyTestTime", settings.daily_test_time);
   setValue("maxAgentStep", state.astrbot?.max_agent_step ?? 30);
 
   renderOrder(settings.send_order);
@@ -150,22 +155,84 @@ function readSettings() {
     notify_on_success: $("notifyOnSuccess").checked,
     max_logs: Number($("maxLogs").value),
     test_receiver_qq: $("testReceiver").value.trim(),
+    daily_test_enabled: $("dailyTestEnabled").checked,
+    daily_test_receiver_qq: $("dailyTestReceiver").value.trim(),
+    daily_test_time: $("dailyTestTime").value || "09:00",
   };
+}
+
+function normalizeOrder(order) {
+  const selected = Array.isArray(order) ? order : [];
+  const known = new Set(defaultOrder);
+  const normalized = selected.filter(
+    (step, index) => known.has(step) && selected.indexOf(step) === index,
+  );
+  return [...normalized, ...defaultOrder.filter((step) => !normalized.includes(step))];
 }
 
 function renderOrder(order) {
   const root = $("order");
   root.innerHTML = "";
   const selected = new Set(order || []);
-  for (const step of ["record", "card", "image", "text"]) {
-    const row = document.createElement("label");
+  for (const step of normalizeOrder(order)) {
+    const row = document.createElement("div");
     row.className = "order-row";
+    row.draggable = true;
+    row.tabIndex = 0;
+    row.dataset.orderRow = step;
     row.innerHTML = `
-      <span>${orderLabels[step]}</span>
+      <span class="drag-handle" aria-hidden="true">::</span>
+      <span class="order-name">${orderLabels[step]}</span>
       <input data-order-step value="${step}" type="checkbox" ${selected.has(step) ? "checked" : ""}>
     `;
     root.appendChild(row);
   }
+  root.querySelectorAll("[data-order-row]").forEach((row) => {
+    row.addEventListener("dragstart", (event) => {
+      row.classList.add("dragging");
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", row.dataset.orderRow);
+    });
+    row.addEventListener("dragend", () => row.classList.remove("dragging"));
+    row.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+      event.preventDefault();
+      const sibling = event.key === "ArrowUp" ? row.previousElementSibling : row.nextElementSibling;
+      if (!sibling) return;
+      if (event.key === "ArrowUp") {
+        root.insertBefore(row, sibling);
+      } else {
+        root.insertBefore(sibling, row);
+      }
+      row.focus();
+    });
+  });
+  root.ondragover = (event) => {
+    event.preventDefault();
+    const row = root.querySelector(".order-row.dragging");
+    if (!row) return;
+    const next = orderDropTarget(root, event.clientY);
+    if (next) {
+      root.insertBefore(row, next);
+    } else {
+      root.appendChild(row);
+    }
+  };
+}
+
+function orderDropTarget(container, y) {
+  const rows = [...container.querySelectorAll("[data-order-row]:not(.dragging)")];
+  return rows.reduce(
+    (closest, row) => {
+      const box = row.getBoundingClientRect();
+      const offset = y - box.top - box.height / 2;
+      if (offset < 0 && offset > closest.offset) {
+        return { offset, element: row };
+      }
+      return closest;
+    },
+    { offset: Number.NEGATIVE_INFINITY, element: null },
+  ).element;
 }
 
 function renderMaterials(containerId, items, activeId, kind) {

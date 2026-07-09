@@ -72,6 +72,22 @@
               测试接收 QQ
               <input id="testReceiver" inputmode="numeric" placeholder="QQ 号" />
             </label>
+            <div class="daily-test">
+              <label class="check">
+                <input id="dailyTestEnabled" type="checkbox" />
+                每日定时发送
+              </label>
+              <div class="inline-grid compact">
+                <label>
+                  定时接收 QQ
+                  <input id="dailyTestReceiver" inputmode="numeric" placeholder="QQ 号" />
+                </label>
+                <label>
+                  每天时间
+                  <input id="dailyTestTime" type="time" />
+                </label>
+              </div>
+            </div>
             <button id="testSend" type="button">发送当前配置</button>
             <p id="testResult" class="muted"></p>
           </section>
