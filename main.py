@@ -26,6 +26,7 @@ DEFAULT_SEND_ORDER = ["record", "card", "image", "text"]
 LEGACY_DEFAULT_SEND_ORDER = ["card", "record", "image", "text"]
 FORWARD_EXPAND_MAX_DEPTH = 6
 DAILY_TEST_POLL_SECONDS = 30
+DIRECT_RECORD_SETTLE_SECONDS = 5.0
 
 
 class ForwardExpandError(RuntimeError):
@@ -352,7 +353,7 @@ class WelcomeCustomizationPlugin(Star):
         normalized = self._normalize_node_data(node)
         if isinstance(node.get("_record_meta"), dict):
             normalized["_record_meta"] = dict(node["_record_meta"])
-        content = await self._prepare_record_segments_for_send(
+        content, extra_nodes = await self._prepare_record_segments_for_send(
             bot,
             normalized.get("content", []),
             routing,
@@ -364,6 +365,7 @@ class WelcomeCustomizationPlugin(Star):
         if content:
             normalized["content"] = content
             result.append(normalized)
+        result.extend(extra_nodes)
         return result
 
     async def _prepare_record_segments_for_send(
@@ -374,43 +376,71 @@ class WelcomeCustomizationPlugin(Star):
         depth: int,
         seen: set[str],
         unresolved: list[str],
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         content: list[dict[str, Any]] = []
+        extra_nodes: list[dict[str, Any]] = []
         for segment in self._normalize_raw_segments(segments):
             data = segment.get("data") if isinstance(segment, dict) else None
             nested_nodes = data.get("_nested_nodes") if isinstance(data, dict) else None
             if segment.get("type") == "forward" and isinstance(nested_nodes, list):
-                nested_segment = await self._nodes_to_nested_node_segment(
-                    bot,
-                    nested_nodes,
-                    routing,
-                    depth + 1,
-                    seen,
-                    unresolved,
-                )
-                if nested_segment:
-                    content.append(nested_segment)
+                for child in nested_nodes:
+                    extra_nodes.extend(
+                        await self._prepare_record_node_for_send(
+                            bot,
+                            deepcopy(child),
+                            routing,
+                            depth + 1,
+                            seen,
+                            unresolved,
+                        ),
+                    )
                 continue
 
             forward_id = self._forward_id_from_segment(segment)
             if forward_id:
-                refreshed = await self._forward_segment_with_nested_backup(
+                nested = await self._fetch_forward_nodes(
                     bot,
                     forward_id,
                     routing,
-                    depth,
+                    depth + 1,
                     seen,
                     unresolved,
+                    "",
                 )
-                if refreshed:
-                    content.append(refreshed)
+                if nested:
+                    for child in nested:
+                        extra_nodes.extend(
+                            await self._prepare_record_node_for_send(
+                                bot,
+                                deepcopy(child),
+                                routing,
+                                depth + 1,
+                                seen,
+                                unresolved,
+                            ),
+                        )
                     continue
                 if segment.get("type") in {"forward", "json"}:
-                    content.append(refreshed or {"type": "forward", "data": {"id": forward_id}})
+                    content.append({"type": "forward", "data": {"id": forward_id}})
                     continue
 
+            embedded_nodes = self._embedded_forward_nodes_from_segment(segment)
+            if embedded_nodes:
+                for child in embedded_nodes:
+                    extra_nodes.extend(
+                        await self._prepare_record_node_for_send(
+                            bot,
+                            self._forward_message_to_node(child),
+                            routing,
+                            depth + 1,
+                            seen,
+                            unresolved,
+                        ),
+                    )
+                continue
+
             content.append(self._strip_internal_segment_fields(segment))
-        return content
+        return content, extra_nodes
 
     async def _nodes_to_nested_node_segment(
         self,
@@ -1003,6 +1033,7 @@ class WelcomeCustomizationPlugin(Star):
                 raise ValueError("未设置启用聊天记录")
             if self._record_is_direct(record):
                 await self._send_direct_record(bot, user_id, record, routing, origin_group_id)
+                await asyncio.sleep(DIRECT_RECORD_SETTLE_SECONDS)
                 return
             await self._send_record_nodes(
                 bot,
