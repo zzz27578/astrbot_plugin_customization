@@ -104,6 +104,7 @@ class WelcomeCustomizationPlugin(Star):
         self.store_path = self.data_dir / "store.json"
         self.store: dict[str, Any] = self._load_store()
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.pending_join_keys: set[str] = set()
         self.worker_task: asyncio.Task | None = None
         self.daily_test_task: asyncio.Task | None = None
 
@@ -536,6 +537,9 @@ class WelcomeCustomizationPlugin(Star):
             except Exception:
                 logger.exception("欢迎私聊队列任务执行失败。")
             finally:
+                join_key = str(job.get("join_key") or "")
+                if join_key:
+                    self.pending_join_keys.discard(join_key)
                 self.queue.task_done()
 
     def _ensure_daily_test_task(self) -> None:
@@ -591,18 +595,20 @@ class WelcomeCustomizationPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=10)
     async def on_any_event(self, event: AstrMessageEvent):
-        raw = getattr(event.message_obj, "raw_message", None)
-        if not self._is_group_increase(raw):
+        raw = self._raw_event_from_event(event)
+        join = self._group_increase_payload(raw)
+        if not join:
             return
 
-        group_id = str(raw.get("group_id", "")).strip()
-        user_id = str(raw.get("user_id", "")).strip()
-        self_id = str(raw.get("self_id", "")).strip()
+        group_id = join["group_id"]
+        user_id = join["user_id"]
+        self_id = join["self_id"]
+        join_key = self._join_key(group_id, user_id)
         if not group_id or not user_id or user_id == self_id:
             return
         if not self._group_enabled(group_id):
             return
-        if self._is_deduped(group_id, user_id):
+        if join_key in self.pending_join_keys or self._is_deduped(group_id, user_id):
             return
 
         bot = getattr(event, "bot", None)
@@ -616,14 +622,15 @@ class WelcomeCustomizationPlugin(Star):
             )
             return
 
-        self._mark_dedupe(group_id, user_id)
         self._ensure_worker()
+        self.pending_join_keys.add(join_key)
         await self.queue.put(
             {
                 "bot": bot,
                 "group_id": group_id,
                 "user_id": user_id,
                 "self_id": self_id,
+                "join_key": join_key,
                 "source": "group_increase",
             },
         )
@@ -714,6 +721,26 @@ class WelcomeCustomizationPlugin(Star):
         args = self._command_args(event, {"群内兜底", "fallback", "group_fallback"})
         yield event.plain_result(self._toggle_command("group_fallback_enabled", args))
 
+    @filter.command("去重", alias={"dedupe"})
+    async def dedupe_command(self, event: AstrMessageEvent):
+        if not self._is_operator(event):
+            return
+        args = self._command_args(event, {"去重", "dedupe"})
+        action = self._normalize_action_word(args[0]) if args else "状态"
+        if action in {"清空", "clear"}:
+            count = len(self.store.get("dedupe", {}))
+            self.store["dedupe"] = {}
+            self.pending_join_keys.clear()
+            self._save()
+            yield event.plain_result(f"已清空入群去重记录：{count} 条")
+            return
+        if action in {"状态", "status"}:
+            yield event.plain_result(
+                f"入群去重：{len(self.store.get('dedupe', {}))} 条；待发送队列：{self.queue.qsize()} 条",
+            )
+            return
+        yield event.plain_result("用法：/去重 状态；/去重 清空")
+
     def _command_args(self, event: AstrMessageEvent, names: set[str]) -> list[str]:
         text = re.sub(r"\s+", " ", event.get_message_str().strip())
         for name in sorted(names, key=len, reverse=True):
@@ -736,11 +763,100 @@ class WelcomeCustomizationPlugin(Star):
 
     @staticmethod
     def _is_group_increase(raw: Any) -> bool:
-        return (
-            hasattr(raw, "get")
-            and raw.get("post_type") == "notice"
-            and raw.get("notice_type") == "group_increase"
+        return bool(WelcomeCustomizationPlugin._group_increase_payload(raw))
+
+    @staticmethod
+    def _raw_event_from_event(event: AstrMessageEvent) -> Any:
+        message_obj = getattr(event, "message_obj", None)
+        candidates = [
+            getattr(message_obj, "raw_message", None),
+            getattr(message_obj, "raw_event", None),
+            getattr(event, "raw_message", None),
+            getattr(event, "raw_event", None),
+            getattr(event, "event", None),
+        ]
+        for candidate in candidates:
+            raw = WelcomeCustomizationPlugin._unwrap_raw_event(candidate)
+            if raw is not None:
+                return raw
+        return None
+
+    @staticmethod
+    def _unwrap_raw_event(value: Any, depth: int = 0) -> Any:
+        if value is None or depth > 4:
+            return None
+        if any(
+            WelcomeCustomizationPlugin._raw_get(value, key)
+            for key in ("notice_type", "noticeType", "post_type", "postType", "type")
+        ):
+            return value
+        for key in ("raw_message", "raw_event", "event", "data", "payload"):
+            nested = WelcomeCustomizationPlugin._raw_get(value, key)
+            raw = WelcomeCustomizationPlugin._unwrap_raw_event(nested, depth + 1)
+            if raw is not None:
+                return raw
+        return None
+
+    @staticmethod
+    def _raw_get(raw: Any, key: str, default: Any = "") -> Any:
+        if raw is None:
+            return default
+        try:
+            if hasattr(raw, "get"):
+                value = raw.get(key, default)
+                if value not in (None, ""):
+                    return value
+        except Exception:
+            pass
+        return getattr(raw, key, default)
+
+    @staticmethod
+    def _first_raw_value(raw: Any, keys: tuple[str, ...]) -> str:
+        for key in keys:
+            value = WelcomeCustomizationPlugin._raw_get(raw, key, "")
+            if value not in (None, ""):
+                return str(value).strip()
+        return ""
+
+    @staticmethod
+    def _group_increase_payload(raw: Any) -> dict[str, str] | None:
+        if raw is None:
+            return None
+        post_type = str(
+            WelcomeCustomizationPlugin._raw_get(raw, "post_type")
+            or WelcomeCustomizationPlugin._raw_get(raw, "postType")
+            or "",
+        ).strip()
+        notice_type = str(
+            WelcomeCustomizationPlugin._raw_get(raw, "notice_type")
+            or WelcomeCustomizationPlugin._raw_get(raw, "noticeType")
+            or WelcomeCustomizationPlugin._raw_get(raw, "type")
+            or "",
+        ).strip()
+        normalized_notice = re.sub(r"[^a-z0-9]", "_", notice_type.lower()).strip("_")
+        allowed = {
+            "group_increase",
+            "group_member_increase",
+            "member_increase",
+            "group_member_added",
+            "member_added",
+        }
+        if post_type and post_type != "notice":
+            return None
+        if normalized_notice not in allowed and not (
+            "group" in normalized_notice
+            and any(word in normalized_notice for word in ("increase", "join", "add"))
+        ):
+            return None
+        group_id = WelcomeCustomizationPlugin._first_raw_value(raw, ("group_id", "groupId", "group"))
+        user_id = WelcomeCustomizationPlugin._first_raw_value(
+            raw,
+            ("user_id", "userId", "member_id", "memberId", "qq", "uin"),
         )
+        self_id = WelcomeCustomizationPlugin._first_raw_value(raw, ("self_id", "selfId", "bot_id", "botId"))
+        if not group_id or not user_id:
+            return None
+        return {"group_id": group_id, "user_id": user_id, "self_id": self_id}
 
     def _group_enabled(self, group_id: str) -> bool:
         settings = self.store["settings"]
@@ -762,13 +878,17 @@ class WelcomeCustomizationPlugin(Star):
         minutes = int(settings.get("dedupe_minutes", 0))
         if minutes <= 0:
             return False
-        key = f"{group_id}:{user_id}"
+        key = self._join_key(group_id, user_id)
         last = float(self.store.get("dedupe", {}).get(key, 0))
         return time.time() - last < minutes * 60
 
     def _mark_dedupe(self, group_id: str, user_id: str) -> None:
-        self.store.setdefault("dedupe", {})[f"{group_id}:{user_id}"] = time.time()
+        self.store.setdefault("dedupe", {})[self._join_key(group_id, user_id)] = time.time()
         self._save()
+
+    @staticmethod
+    def _join_key(group_id: str, user_id: str) -> str:
+        return f"{group_id}:{user_id}"
 
     async def _process_join_job(self, job: dict[str, Any]) -> None:
         bot = job["bot"]
@@ -800,6 +920,7 @@ class WelcomeCustomizationPlugin(Star):
             "" if ok else "；".join(item["error"] for item in failed_steps),
             step_results,
         )
+        self._mark_dedupe(group_id, user_id)
 
         if ok:
             if (
@@ -2200,7 +2321,8 @@ class WelcomeCustomizationPlugin(Star):
             "/图片 使用/列表/删除 名称\n"
             "/管理员 添加/删除 QQ\n"
             "/通知 开|关\n"
-            "/群内兜底 开|关"
+            "/群内兜底 开|关\n"
+            "/去重 状态/清空"
         )
 
     async def _extract_card_json(self, event: AstrMessageEvent) -> str:

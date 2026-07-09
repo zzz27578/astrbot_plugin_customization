@@ -106,6 +106,8 @@ git clone https://github.com/zzz27578/astrbot_plugin_customization.git
 /图片 删除 名称
 /管理员 添加 QQ
 /管理员 删除 QQ
+/去重 状态
+/去重 清空
 /通知 开
 /通知 关
 /群内兜底 开
