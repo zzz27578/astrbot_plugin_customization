@@ -373,6 +373,11 @@ class WelcomeCustomizationPlugin(Star):
         for segment in self._normalize_raw_segments(segments):
             data = segment.get("data") if isinstance(segment, dict) else None
             nested_nodes = data.get("_nested_nodes") if isinstance(data, dict) else None
+            forward_id = self._forward_id_from_segment(segment)
+            if segment.get("type") == "forward" and forward_id:
+                content.append({"type": "forward", "data": {"id": forward_id}})
+                continue
+
             if segment.get("type") == "forward" and isinstance(nested_nodes, list):
                 nested_segment = await self._nodes_to_nested_node_segment(
                     bot,
@@ -385,19 +390,6 @@ class WelcomeCustomizationPlugin(Star):
                 if nested_segment:
                     content.append(nested_segment)
                     continue
-
-            forward_id = self._forward_id_from_segment(segment)
-            if segment.get("type") == "forward" and forward_id:
-                refreshed = await self._forward_segment_with_nested_backup(
-                    bot,
-                    forward_id,
-                    routing,
-                    depth,
-                    seen,
-                    unresolved,
-                )
-                content.append(refreshed or {"type": "forward", "data": {"id": forward_id}})
-                continue
 
             content.append(self._strip_internal_segment_fields(segment))
         return content
@@ -1247,17 +1239,17 @@ class WelcomeCustomizationPlugin(Star):
         if not origin_group_id:
             return [("send_private_msg", base)]
         group_id = int(origin_group_id)
+        with_group = {**base, "group_id": group_id}
         return [
+            ("send_private_msg", with_group),
             (
                 "send_msg",
                 {
-                    **base,
+                    **with_group,
                     "message_type": "private",
                     "sub_type": "group",
-                    "group_id": group_id,
                 },
             ),
-            ("send_private_msg", {**base, "group_id": group_id}),
         ]
 
     async def _call_send_attempts(
@@ -1283,7 +1275,11 @@ class WelcomeCustomizationPlugin(Star):
 
     @staticmethod
     def _trusted_direct_record_strategy(strategy: str) -> bool:
-        return strategy in {"forward_segment_private", "forward_node_id_private"}
+        return strategy in {
+            "forward_segment_private",
+            "forward_node_id_private",
+            "forward_friend_single_msg",
+        }
 
     async def _send_direct_record(
         self,
@@ -1301,7 +1297,6 @@ class WelcomeCustomizationPlugin(Star):
                 routing,
                 origin_group_id,
                 stop_on_success=True,
-                trusted_only=True,
             )
         except Exception as e:
             attempts = [{"strategy": "direct_source", "ok": False, "error": str(e)}]
@@ -1330,7 +1325,6 @@ class WelcomeCustomizationPlugin(Star):
                     routing,
                     origin_group_id,
                     stop_on_success=True,
-                    trusted_only=True,
                 )
             except Exception as e:
                 retry_attempts = [{"strategy": "direct_source_retry", "ok": False, "error": str(e)}]
@@ -1482,20 +1476,22 @@ class WelcomeCustomizationPlugin(Star):
         group_id = int(origin_group_id)
         with_group = {**params, "group_id": group_id}
         return [
+            ("send_private_forward_msg", with_group),
             (
                 "send_forward_msg",
                 {
                     **with_group,
                     "message_type": "private",
+                    "sub_type": "group",
                     "message": with_group.get("messages", []),
                 },
             ),
-            ("send_private_forward_msg", with_group),
             (
                 "send_msg",
                 {
                     **with_group,
                     "message_type": "private",
+                    "sub_type": "group",
                     "message": with_group.get("messages", []),
                 },
             ),
@@ -1580,22 +1576,27 @@ class WelcomeCustomizationPlugin(Star):
         if source_forward_id:
             strategies.append("forward_segment_private")
         strategies.append("forward_node_id_private")
+        if not target_group_id:
+            strategies.append("forward_friend_single_msg")
         if target_group_id:
             strategies.append("forward_node_id_private_without_group")
+            strategies.append("forward_friend_single_msg")
         else:
-            strategies.extend(
-                [
-                    "forward_node_id_private_without_group",
-                    "forward_friend_single_msg",
-                ],
-            )
+            strategies.append("forward_node_id_private_without_group")
         if trusted_only:
             strategies = [
                 strategy
                 for strategy in strategies
                 if self._trusted_direct_record_strategy(strategy)
             ]
-        if self._trusted_direct_record_strategy(preferred) and preferred in strategies:
+        prefer_allowed = not (
+            preferred == "forward_friend_single_msg" and bool(target_group_id)
+        )
+        if (
+            prefer_allowed
+            and self._trusted_direct_record_strategy(preferred)
+            and preferred in strategies
+        ):
             strategies.remove(preferred)
             strategies.insert(0, preferred)
 
@@ -2234,6 +2235,13 @@ class WelcomeCustomizationPlugin(Star):
         content = snapshot.get("content", [])
         if not content:
             return []
+        unresolved_ids = []
+        for segment in content:
+            forward_id = self._forward_id_from_segment(segment)
+            if forward_id and forward_id not in unresolved_ids:
+                unresolved_ids.append(forward_id)
+        if unresolved_ids:
+            raise ForwardExpandError(unresolved_ids)
         return [
             {
                 "user_id": str(snapshot.get("user_id") or event.get_sender_id()),
@@ -2483,11 +2491,12 @@ class WelcomeCustomizationPlugin(Star):
         for component in self._reply_chain(event, include_reply=True):
             if isinstance(component, Reply) and component.chain:
                 for seg in self._components_to_segments(component.chain):
-                    if seg.get("type") == "forward" and seg.get("data", {}).get("id"):
+                    forward_id = self._forward_id_from_segment(seg)
+                    if forward_id:
                         try:
                             nodes = await self._fetch_forward_nodes(
                                 event.bot,
-                                str(seg["data"]["id"]),
+                                forward_id,
                                 {},
                             )
                             if nodes:
@@ -2876,16 +2885,43 @@ class WelcomeCustomizationPlugin(Star):
             for item in WelcomeCustomizationPlugin._walk_json_values(data)
             if isinstance(item, str)
         )
-        hints = (
+        strong_hints = (
             "com.tencent.multimsg",
             "multimsg",
             "multi_msg",
+        )
+        if any(hint.lower() in haystack for hint in strong_hints):
+            return True
+
+        resource_keys = {
+            "mresid",
+            "resid",
+            "forwardid",
+            "forwardmsgid",
+            "multimsgid",
+        }
+
+        def has_forward_resource_key(value: Any) -> bool:
+            if isinstance(value, dict):
+                for item_key, item_value in value.items():
+                    normalized_key = re.sub(r"[^a-z0-9]", "", str(item_key).lower())
+                    if normalized_key in resource_keys:
+                        return True
+                    if has_forward_resource_key(item_value):
+                        return True
+            if isinstance(value, list):
+                return any(has_forward_resource_key(item) for item in value)
+            return False
+
+        if not has_forward_resource_key(data):
+            return False
+        text_hints = (
             "[聊天记录]",
             "聊天记录",
             "群聊的聊天记录",
             "转发消息",
         )
-        return any(hint.lower() in haystack for hint in hints)
+        return any(hint.lower() in haystack for hint in text_hints)
 
     @staticmethod
     def _extract_forward_id_from_json_card(data: Any) -> str:
@@ -2993,12 +3029,6 @@ class WelcomeCustomizationPlugin(Star):
                 continue
             data = segment.get("data") or {}
             if segment.get("type") == "json":
-                forward_segment = self._json_card_to_forward_segment(
-                    data.get("data") if isinstance(data, dict) and "data" in data else data,
-                )
-                if forward_segment:
-                    ret.append(forward_segment)
-                    continue
                 if not isinstance(data.get("data"), str):
                     data = dict(data)
                     data["data"] = self._json_segment_to_raw(data.get("data"))
@@ -3018,16 +3048,12 @@ class WelcomeCustomizationPlugin(Star):
                     },
                 )
             elif isinstance(component, Json):
-                forward_segment = self._json_card_to_forward_segment(component.data)
-                if forward_segment:
-                    ret.append(forward_segment)
-                else:
-                    ret.append(
-                        {
-                            "type": "json",
-                            "data": {"data": self._json_segment_to_raw(component.data)},
-                        },
-                    )
+                ret.append(
+                    {
+                        "type": "json",
+                        "data": {"data": self._json_segment_to_raw(component.data)},
+                    },
+                )
             elif isinstance(component, Forward):
                 ret.append({"type": "forward", "data": {"id": str(component.id)}})
             elif isinstance(component, At):
