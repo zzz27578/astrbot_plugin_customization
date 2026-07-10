@@ -2442,17 +2442,19 @@ class WelcomeCustomizationPlugin(Star):
         forward_id = str(source.get("source_forward_id") or "").strip()
         if not forward_id:
             forward_id = await self._extract_record_root_forward_id(event)
-        if not forward_id:
+        message_id = str(source.get("source_message_id") or "").strip()
+        if not forward_id and not message_id:
             return None
         source_data: dict[str, Any] = {
+            "mode": "forward_resource" if forward_id else "direct_forward",
             "record_forward_id": forward_id,
-            "source_message_id": source.get("source_message_id", ""),
+            "source_message_id": message_id,
             "source_group_id": source.get("source_group_id", ""),
             "source_user_id": source.get("source_user_id", ""),
             "source_self_id": source.get("source_self_id", ""),
         }
         bot = getattr(event, "bot", None)
-        if bot is not None:
+        if bot is not None and forward_id:
             routing = (
                 {"self_id": source["source_self_id"]}
                 if source.get("source_self_id")
@@ -2465,8 +2467,11 @@ class WelcomeCustomizationPlugin(Star):
                     routing,
                 )
             except Exception:
-                logger.exception("聊天记录节点缓存失败，拒绝保存不可验证的转发资源。")
-                return None
+                if not message_id:
+                    logger.exception("聊天记录节点缓存失败，且没有可直转的外层消息。")
+                    return None
+                logger.exception("聊天记录节点缓存失败，改用外层原消息直转以保留嵌套结构。")
+                source_data["mode"] = "direct_forward"
         return source_data
 
     async def _extract_record_root_forward_id(self, event: AstrMessageEvent) -> str:
