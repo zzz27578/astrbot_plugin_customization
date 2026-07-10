@@ -381,35 +381,25 @@ class WelcomeCustomizationPlugin(Star):
         content: list[dict[str, Any]] = []
         extra_nodes: list[dict[str, Any]] = []
         for segment in self._normalize_raw_segments(segments):
+            forward_id = self._forward_id_from_segment(segment)
+            if forward_id:
+                content.append({"type": "forward", "data": {"id": forward_id}})
+                continue
+
             data = segment.get("data") if isinstance(segment, dict) else None
             nested_nodes = data.get("_nested_nodes") if isinstance(data, dict) else None
             if segment.get("type") == "forward" and isinstance(nested_nodes, list):
-                nested_segment = await self._nodes_to_nested_node_segment(
-                    bot,
-                    nested_nodes,
-                    routing,
-                    depth + 1,
-                    seen,
-                    unresolved,
-                )
-                if nested_segment:
-                    content.append(nested_segment)
-                continue
-
-            forward_id = self._forward_id_from_segment(segment)
-            if forward_id:
-                nested_segment = await self._forward_segment_with_nested_backup(
-                    bot,
-                    forward_id,
-                    routing,
-                    depth,
-                    seen,
-                    unresolved,
-                )
-                if nested_segment:
-                    content.append(nested_segment)
-                else:
-                    content.append({"type": "forward", "data": {"id": forward_id}})
+                for child in nested_nodes:
+                    extra_nodes.extend(
+                        await self._prepare_record_node_for_send(
+                            bot,
+                            deepcopy(child),
+                            routing,
+                            depth + 1,
+                            seen,
+                            unresolved,
+                        ),
+                    )
                 continue
 
             embedded_nodes = self._embedded_forward_nodes_from_segment(segment)
@@ -1143,12 +1133,63 @@ class WelcomeCustomizationPlugin(Star):
                 await self._send_direct_record(bot, user_id, record, routing, origin_group_id)
                 await asyncio.sleep(DIRECT_RECORD_SETTLE_SECONDS)
                 return
-            nodes = record.get("nodes") or []
-            if nodes:
-                await self._send_record_nodes(bot, user_id, nodes, routing, origin_group_id)
-                await asyncio.sleep(DIRECT_RECORD_SETTLE_SECONDS)
+            root_forward_id = str(record.get("root_forward_id") or "").strip()
+            if origin_group_id and root_forward_id:
+                try:
+                    await self._send_record_forward_id(
+                        bot,
+                        user_id,
+                        root_forward_id,
+                        routing,
+                        origin_group_id,
+                    )
+                    return
+                except Exception:
+                    logger.exception("临时会话原始 forward 资源发送失败，尝试原消息转发。")
+            source_message_id = str(record.get("root_message_id") or "").strip()
+            if source_message_id:
+                forward_routing = dict(routing)
+                root_source_self_id = str(record.get("root_source_self_id") or "").strip()
+                if root_source_self_id:
+                    forward_routing["self_id"] = root_source_self_id
+                await self._forward_single_message_to_user(
+                    bot,
+                    user_id,
+                    source_message_id,
+                    forward_routing,
+                    origin_group_id,
+                )
                 return
-            raise RuntimeError("该聊天记录没有可发送内容；请重新回复原始聊天记录执行 /记录 添加 名称")
+            raise RuntimeError("该聊天记录不是原始消息素材；请重新回复原始聊天记录执行 /记录 添加 名称")
+            root_forward_id = str(record.get("root_forward_id") or "").strip()
+            if root_forward_id:
+                try:
+                    delivery_group_id = str(
+                        origin_group_id
+                        or record.get("root_forward_group_id")
+                        or record.get("source_group_id")
+                        or "",
+                    )
+                    await self._send_record_forward_id(
+                        bot,
+                        user_id,
+                        root_forward_id,
+                        routing,
+                        delivery_group_id or None,
+                    )
+                    return
+                except Exception:
+                    if not record.get("nodes"):
+                        raise
+                    logger.exception("原始合并转发 id 发送失败，降级为本地节点备份。")
+            await self._send_record_nodes(
+                bot,
+                user_id,
+                record.get("nodes", []),
+                routing,
+                origin_group_id,
+            )
+            return
         if step == "image":
             image = self._active_item("images", "active_image_id")
             if not image:
@@ -1432,11 +1473,12 @@ class WelcomeCustomizationPlugin(Star):
     def _record_has_content(self, record: dict[str, Any]) -> bool:
         if self._record_is_direct(record):
             return bool(record.get("source_message_id") or record.get("nodes"))
-        return bool(record.get("nodes"))
+        return bool(record.get("root_message_id") or record.get("root_forward_id") or record.get("nodes"))
 
     @staticmethod
     def _trusted_direct_record_strategy(strategy: str) -> bool:
         return strategy in {
+            "forward_resource_msg",
             "forward_single_msg",
             "forward_group_single_msg",
             "forward_friend_single_msg",
@@ -1462,20 +1504,6 @@ class WelcomeCustomizationPlugin(Star):
         origin_group_id: str | None = None,
     ) -> None:
         direct_routing = self._direct_record_routing(record, routing)
-        if origin_group_id and record.get("nodes"):
-            await self._send_record_nodes(
-                bot,
-                user_id,
-                record.get("nodes", []),
-                direct_routing,
-                origin_group_id,
-            )
-            record["last_strategy"] = "local_backup_nodes"
-            record["last_backup_send_at"] = int(time.time())
-            record.pop("last_error", None)
-            record["updated_at"] = int(time.time())
-            self._save()
-            return
         try:
             attempts = await self._try_direct_record_strategies(
                 bot,
@@ -1531,7 +1559,7 @@ class WelcomeCustomizationPlugin(Star):
                 self._save()
                 return
 
-        fallback_nodes = record.get("nodes") or []
+        fallback_nodes = []
         if fallback_nodes:
             try:
                 started_at = int(time.time())
@@ -1700,6 +1728,85 @@ class WelcomeCustomizationPlugin(Star):
                 routing,
             ):
                 return
+            errors.append(f"{action}: API 返回成功，但最近私聊历史未确认收到聊天记录")
+        raise RuntimeError("; ".join(errors) or "原消息转发失败")
+
+    async def _send_original_node_to_temp_chat_confirmed(
+        self,
+        bot: Any,
+        user_id: str,
+        message_id: str,
+        routing: dict[str, Any],
+        origin_group_id: str,
+    ) -> None:
+        payload = {
+            "message_type": "private",
+            "sub_type": "group",
+            "user_id": int(user_id),
+            "group_id": int(origin_group_id),
+            "message": [{"type": "node", "data": {"id": message_id}}],
+            **routing,
+        }
+        wait_seconds = float(self.store["settings"].get("delivery_confirm_wait_seconds", 8))
+        errors: list[str] = []
+        for action in ("send_msg", "send_private_forward_msg", "send_forward_msg"):
+            params = dict(payload)
+            if action != "send_msg":
+                params["messages"] = params["message"]
+            started_at = int(time.time())
+            try:
+                await bot.call_action(action, **params)
+            except Exception as e:
+                errors.append(f"{action}: {e}")
+                continue
+            await asyncio.sleep(wait_seconds)
+            if await self._confirm_recent_private_delivery(
+                bot,
+                user_id,
+                [{"type": "forward"}],
+                started_at,
+                routing,
+            ):
+                return
+            errors.append(f"{action}: API 返回成功，但最近私聊历史未确认收到聊天记录")
+        raise RuntimeError("; ".join(errors) or "临时会话原消息节点发送失败")
+
+    async def _forward_single_message_to_user(
+        self,
+        bot: Any,
+        user_id: str,
+        message_id: str,
+        routing: dict[str, Any],
+        origin_group_id: str | None = None,
+    ) -> None:
+        wait_seconds = float(self.store["settings"].get("delivery_confirm_wait_seconds", 8))
+        errors: list[str] = []
+        for action in ("forward_friend_single_msg", "forward_group_single_msg"):
+            started_at = int(time.time())
+            try:
+                params = {
+                    "user_id": int(user_id),
+                    "message_id": message_id,
+                    **routing,
+                }
+                if origin_group_id:
+                    params["group_id"] = int(origin_group_id)
+                await bot.call_action(
+                    action,
+                    **params,
+                )
+            except Exception as e:
+                errors.append(f"{action}: {e}")
+                continue
+            await asyncio.sleep(wait_seconds)
+            if await self._confirm_recent_private_delivery(
+                bot,
+                user_id,
+                [{"type": "forward"}],
+                started_at,
+                routing,
+            ):
+                return
             errors.append(f"{action}: API returned success but private history did not confirm delivery")
         raise RuntimeError("; ".join(errors) or "forward original message failed")
 
@@ -1762,29 +1869,29 @@ class WelcomeCustomizationPlugin(Star):
         origin_group_id: str | None = None,
     ) -> list[tuple[str, dict[str, Any]]]:
         if not origin_group_id:
-            return [
-                ("send_private_forward_msg", params),
-                (
-                    "send_forward_msg",
-                    {
-                        **params,
-                        "message_type": "private",
-                        "message": params.get("messages", []),
-                    },
-                ),
-            ]
+            return [("send_private_forward_msg", params)]
         group_id = int(origin_group_id)
         with_group = {**params, "group_id": group_id}
         return [
+            (
+                "send_msg",
+                {
+                    **with_group,
+                    "message_type": "private",
+                    "sub_type": "group",
+                    "message": with_group.get("messages", []),
+                },
+            ),
+            ("send_private_forward_msg", with_group),
             (
                 "send_forward_msg",
                 {
                     **with_group,
                     "message_type": "private",
+                    "sub_type": "group",
                     "message": with_group.get("messages", []),
                 },
             ),
-            ("send_private_forward_msg", params),
         ]
 
     def _node_for_send(self, node: dict[str, Any]) -> dict[str, Any]:
@@ -1859,8 +1966,14 @@ class WelcomeCustomizationPlugin(Star):
         source_message_id = str(record.get("source_message_id") or "").strip()
         if not source_message_id:
             raise ValueError("直转记录缺少原消息 message_id")
+        source_forward_id = str(record.get("source_forward_id") or "").strip()
+        source_group_id = str(record.get("source_group_id") or "").strip()
+        delivery_group_id = str(origin_group_id or source_group_id or "").strip()
         preferred = str(record.get("last_strategy") or "").strip()
-        strategies: list[str] = ["forward_single_msg"]
+        strategies: list[str] = []
+        if source_forward_id:
+            strategies.append("forward_resource_msg")
+        strategies.append("forward_single_msg")
         if trusted_only:
             strategies = [
                 strategy
@@ -1875,15 +1988,36 @@ class WelcomeCustomizationPlugin(Star):
         for strategy in strategies:
             started_at = int(time.time())
             try:
-                await self._forward_single_message_to_user(
-                    bot,
-                    user_id,
-                    source_message_id,
-                    routing,
-                    origin_group_id,
-                )
+                if strategy == "forward_resource_msg":
+                    await self._send_forward_id_private_confirmed(
+                        bot,
+                        user_id,
+                        source_forward_id,
+                        routing,
+                        delivery_group_id or None,
+                    )
+                elif strategy == "forward_single_msg":
+                    await self._forward_single_message_to_user(
+                        bot,
+                        user_id,
+                        source_message_id,
+                        routing,
+                        origin_group_id,
+                    )
+                else:
+                    await self._send_direct_record_by_strategy(
+                        bot,
+                        strategy,
+                        user_id,
+                        source_message_id,
+                        source_forward_id,
+                        "",
+                        "",
+                        routing,
+                    )
                 if confirm_delivery and strategy not in {
                     "forward_single_msg",
+                    "forward_resource_msg",
                 }:
                     wait_seconds = float(
                         self.store["settings"].get("delivery_confirm_wait_seconds", 8),
@@ -2152,8 +2286,12 @@ class WelcomeCustomizationPlugin(Star):
             try:
                 nodes = await self._extract_record_nodes(event)
             except ForwardExpandError as e:
-                return f"该聊天记录包含 NapCat 无法读取的内层消息，未保存。{e}\n可改用 /记录 直转 名称 保存原消息直转素材。"
-            if not nodes:
+                if not root_source:
+                    return f"该聊天记录包含 NapCat 无法读取的内层消息，未保存。{e}\n可改用 /记录 直转 名称 保存原消息直转素材。"
+                nodes = []
+            if root_source:
+                nodes = []
+            if not nodes and not root_forward_id and not root_source:
                 return "没有在引用消息中找到可保存的聊天记录内容。"
             record_id = self._find_material_id_by_name("records", name)
             if not record_id:
@@ -2201,6 +2339,8 @@ class WelcomeCustomizationPlugin(Star):
             self.store["records"][record_id]["updated_at"] = int(time.time())
             self.store["settings"]["active_record_id"] = record_id
             self._save()
+            if root_source:
+                return f"已保存并启用原始聊天记录：{name}。发送时会直接转发被引用的原消息，不展开、不重建。"
             return self._record_save_message(name, nodes)
         if action in {"直转", "原转发", "direct", "raw"}:
             name = args[1] if len(args) > 1 else f"直转记录{len(self.store['records']) + 1}"
@@ -2776,7 +2916,7 @@ class WelcomeCustomizationPlugin(Star):
                 lines.append(f"原消息缓存刷新失败：{e}")
             if refreshed:
                 lines.append("已从 QQ 上下文重新读取原消息信息，可再次执行探测确认直转。")
-            if record.get("nodes"):
+            if False and record.get("nodes"):
                 try:
                     started_at = int(time.time())
                     await self._send_record_nodes(
@@ -3003,20 +3143,7 @@ class WelcomeCustomizationPlugin(Star):
         for segment in self._normalize_raw_segments(segments):
             forward_id = self._forward_id_from_segment(segment)
             if forward_id:
-                expanded = await self._fetch_forward_nodes(
-                    bot,
-                    forward_id,
-                    routing,
-                    depth + 1,
-                    seen,
-                    unresolved,
-                    current_forward_id,
-                )
-                data = {"id": forward_id}
-                if expanded:
-                    data["_nested_nodes"] = expanded
-                    data["_source_forward_id"] = forward_id
-                content.append({"type": "forward", "data": data})
+                content.append({"type": "forward", "data": {"id": forward_id}})
                 continue
             content.append(segment)
         return content, nested_nodes
