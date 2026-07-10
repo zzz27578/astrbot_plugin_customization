@@ -29,7 +29,7 @@ class RecordFailureHandlingTest(unittest.TestCase):
         plugin._save = lambda: None
         return plugin
 
-    def test_forward_capture_failure_returns_no_source(self) -> None:
+    def test_forward_capture_failure_falls_back_to_outer_message(self) -> None:
         # Given a reply whose root forward id exists but whose nodes are unreadable.
         plugin = self._plugin()
 
@@ -52,11 +52,17 @@ class RecordFailureHandlingTest(unittest.TestCase):
         # When the plugin captures the forward record.
         source = asyncio.run(plugin._extract_forward_record_source(event))
 
-        # Then the failed resource is rejected instead of becoming saveable data.
-        self.assertIsNone(source)
+        # Then the outer message remains saveable for QQ-native direct forwarding.
+        self.assertEqual(source["mode"], "direct_forward")
+        self.assertEqual(source["source_message_id"], "123")
+        self.assertEqual(source["source_group_id"], "456")
+        self.assertEqual(source["source_user_id"], "789")
+        self.assertEqual(source["source_self_id"], "10000")
+        self.assertEqual(source["record_forward_id"], "expired-inner-forward")
+        self.assertNotIn("nodes", source)
 
-    def test_record_add_failure_does_not_save_or_replace_active_record(self) -> None:
-        # Given an existing active record and a new capture that failed.
+    def test_record_add_saves_outer_message_fallback_as_direct_record(self) -> None:
+        # Given an existing active record and a nested capture using the outer message fallback.
         plugin = self._plugin({"active_record_id": "existing-record"})
         plugin.store["records"]["existing-record"] = {
             "id": "existing-record",
@@ -64,20 +70,73 @@ class RecordFailureHandlingTest(unittest.TestCase):
             "record_forward_id": "working-forward",
         }
 
-        async def capture_failed(_event: Any) -> None:
-            return None
+        async def capture_fallback(_event: Any) -> dict[str, str]:
+            return {
+                "mode": "direct_forward",
+                "record_forward_id": "expired-inner-forward",
+                "source_message_id": "123",
+                "source_group_id": "456",
+                "source_user_id": "789",
+                "source_self_id": "10000",
+            }
 
-        plugin._extract_forward_record_source = capture_failed
+        plugin._extract_forward_record_source = capture_fallback
 
-        # When `/记录 添加` handles the failed capture.
+        # When `/记录 添加` handles the fallback capture.
         message = asyncio.run(
-            plugin._record_command(SimpleNamespace(), ["添加", "失败记录"]),
+            plugin._record_command(SimpleNamespace(), ["添加", "嵌套记录"]),
         )
 
-        # Then no false success is reported and the active record is untouched.
-        self.assertNotIn("已保存并启用", message)
-        self.assertEqual(plugin.store["settings"]["active_record_id"], "existing-record")
-        self.assertEqual(list(plugin.store["records"]), ["existing-record"])
+        # Then it replaces the active selection with a direct record of the outer message.
+        self.assertIn("已保存并启用", message)
+        active_id = plugin.store["settings"]["active_record_id"]
+        self.assertNotEqual(active_id, "existing-record")
+        record = plugin.store["records"][active_id]
+        self.assertEqual(record["name"], "嵌套记录")
+        self.assertEqual(record["mode"], "direct_forward")
+        self.assertEqual(record["source_message_id"], "123")
+        self.assertEqual(record["source_group_id"], "456")
+        self.assertEqual(record["record_forward_id"], "expired-inner-forward")
+
+    def test_outer_message_fallback_uses_group_temporary_forward_route(self) -> None:
+        # Given a direct fallback record captured from an outer group forward message.
+        plugin = self._plugin()
+
+        class TemporarySessionBot:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, Any]]] = []
+
+            async def call_action(self, action: str, **params: Any) -> dict[str, Any]:
+                self.calls.append((action, params))
+                return {"status": "ok", "retcode": 0}
+
+        bot = TemporarySessionBot()
+        record = {
+            "mode": "direct_forward",
+            "source_message_id": "123",
+            "source_group_id": "456",
+            "source_self_id": "10000",
+        }
+
+        # When the record is sent one-way to a newly joined group member.
+        asyncio.run(plugin._send_record(bot, "789", record, {}, "456"))
+
+        # Then the first route forwards the untouched outer group message to that user.
+        self.assertEqual(
+            bot.calls,
+            [
+                (
+                    "forward_group_single_msg",
+                    {
+                        "user_id": 789,
+                        "message_id": 123,
+                        "self_id": "10000",
+                        "group_id": 456,
+                    },
+                ),
+            ],
+        )
+        self.assertEqual(record["last_strategy"], "forward_group_single_msg")
 
     def test_temp_session_ambiguous_timeout_is_unverifiable_without_compensation(self) -> None:
         # Given an ambiguous send timeout in a non-friend group temporary session.
