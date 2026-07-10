@@ -83,6 +83,14 @@ DEFAULT_STORE: dict[str, Any] = {
 }
 
 
+class AmbiguousSendTimeout(RuntimeError):
+    """A send timeout that may have reached QQ without a definitive result."""
+
+    def __init__(self, message: str, is_temporary_session: bool) -> None:
+        super().__init__(message)
+        self.is_temporary_session = is_temporary_session
+
+
 class WelcomeCustomizationPlugin(Star):
     """新人入群自动私聊欢迎素材：QQ 卡片、聊天记录和图片。"""
 
@@ -922,6 +930,8 @@ class WelcomeCustomizationPlugin(Star):
                         step,
                         routing,
                         origin_group_id,
+                        isinstance(e, AmbiguousSendTimeout)
+                        and e.is_temporary_session,
                         use_missing_fallback,
                         fallback_text,
                         markers,
@@ -969,6 +979,7 @@ class WelcomeCustomizationPlugin(Star):
         step: str,
         routing: dict[str, Any],
         origin_group_id: str | None,
+        is_temporary_session: bool,
         use_missing_fallback: bool,
         fallback_text: str,
         markers: list[dict[str, Any]],
@@ -992,6 +1003,17 @@ class WelcomeCustomizationPlugin(Star):
                 "error": "",
                 "verified": True,
                 "ambiguous_timeout": True,
+            }
+
+        if is_temporary_session:
+            return {
+                "step": step,
+                "ok": False,
+                "attempts": attempts_done,
+                "error": f"{step}: {last_error}",
+                "ambiguous_timeout": True,
+                "unverifiable": True,
+                "fallback": use_missing_fallback,
             }
 
         compensation_count = int(settings.get("delivery_compensation_count", 1))
@@ -1345,6 +1367,11 @@ class WelcomeCustomizationPlugin(Star):
             try:
                 return await bot.call_action(action, **params)
             except Exception as e:
+                if self._is_ambiguous_send_timeout(e):
+                    raise AmbiguousSendTimeout(
+                        str(e),
+                        bool(params.get("group_id")),
+                    ) from e
                 errors.append(f"{action}: {e}")
         raise RuntimeError("; ".join(errors))
 
@@ -2438,7 +2465,8 @@ class WelcomeCustomizationPlugin(Star):
                     routing,
                 )
             except Exception:
-                logger.exception("聊天记录节点缓存失败，将保留原资源和原消息兜底。")
+                logger.exception("聊天记录节点缓存失败，拒绝保存不可验证的转发资源。")
+                return None
         return source_data
 
     async def _extract_record_root_forward_id(self, event: AstrMessageEvent) -> str:
