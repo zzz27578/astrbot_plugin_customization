@@ -1752,6 +1752,7 @@ class WelcomeCustomizationPlugin(Star):
             "send_private_forward_msg",
             user_id=int(user_id),
             messages=messages,
+            timeout=60000,
             **routing,
         )
         self._ensure_record_action_success("rebuilt_nodes", result)
@@ -1759,7 +1760,7 @@ class WelcomeCustomizationPlugin(Star):
     def _record_node_for_send(self, node: dict[str, Any]) -> dict[str, Any]:
         content = self._normalize_raw_segments(node.get("content", []))
         return {
-            "user_id": str(node.get("user_id") or node.get("uin") or "0"),
+            "user_id": int(node.get("user_id") or node.get("uin") or 0),
             "nickname": str(node.get("nickname") or node.get("name") or "QQ用户"),
             "content": content,
         }
