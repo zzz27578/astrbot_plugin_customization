@@ -136,6 +136,42 @@ class NestedNapCat(FakeNapCat):
         raise AssertionError(f"unexpected NapCat action: {action}")
 
 
+class RealNapCatInlineNested(FakeNapCat):
+    """Simulates real NapCat behavior: outer get_forward_msg returns inline nested content."""
+
+    async def call_action(self, action: str, **params: Any) -> dict[str, Any]:
+        self.calls.append((action, params))
+        if action == "get_forward_msg" and params["id"] == "real-outer-id":
+            return {
+                "messages": [
+                    {
+                        "type": "node",
+                        "data": {
+                            "user_id": 10001,
+                            "nickname": "甲",
+                            "message": [
+                                {
+                                    "type": "node",
+                                    "data": {
+                                        "user_id": 10002,
+                                        "nickname": "乙",
+                                        "message": [
+                                            {"type": "text", "data": {"text": "真实内层"}},
+                                        ],
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                ],
+            }
+        if action == "get_forward_msg" and params.get("id", "").startswith("inner"):
+            raise RuntimeError("消息已过期或者为内层消息，无法获取转发消息")
+        if action == "send_private_forward_msg":
+            return {"status": "ok", "retcode": 0, "message_id": 789}
+        raise AssertionError(f"unexpected NapCat action: {action}")
+
+
 class RecordDeliveryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -243,6 +279,32 @@ class RecordDeliveryTest(unittest.TestCase):
         self.assertEqual(bot.calls[-1][0], "send_private_forward_msg")
         self.assertEqual(record["last_strategy"], "rebuilt_nodes")
         self.assertEqual(len(record["nodes"]), 2)
+
+    def test_parses_inline_nested_nodes_without_inner_get_forward_msg(self) -> None:
+        """Real NapCat returns inline nested content; inner ID calls are rejected."""
+        plugin = self.module.WelcomeCustomizationPlugin.__new__(
+            self.module.WelcomeCustomizationPlugin,
+        )
+        plugin.store = {"settings": {}, "records": {}}
+        plugin._save = lambda: None
+        bot = RealNapCatInlineNested()
+
+        nodes = asyncio.run(
+            plugin._record_nodes_from_forward(bot, "real-outer-id", {}),
+        )
+
+        get_calls = [c for c in bot.calls if c[0] == "get_forward_msg"]
+        self.assertEqual(len(get_calls), 1, "Should call get_forward_msg only once")
+        self.assertEqual(get_calls[0][1]["id"], "real-outer-id")
+
+        self.assertEqual(len(nodes), 1, "Outer should produce one node")
+        outer_content = nodes[0]["content"]
+        self.assertEqual(len(outer_content), 1, "Outer content should have one nested node")
+        self.assertEqual(outer_content[0]["type"], "node")
+        nested_data = outer_content[0]["data"]
+        self.assertEqual(nested_data["user_id"], 10002)
+        self.assertEqual(nested_data["nickname"], "乙")
+        self.assertEqual(nested_data["content"][0]["data"]["text"], "真实内层")
 
 
 if __name__ == "__main__":

@@ -98,7 +98,7 @@ class RecordFailureHandlingTest(unittest.TestCase):
         self.assertEqual(record["source_group_id"], "456")
         self.assertEqual(record["record_forward_id"], "expired-inner-forward")
 
-    def test_outer_message_fallback_uses_group_temporary_forward_route(self) -> None:
+    def test_outer_message_fallback_emits_group_single_forward_attempt(self) -> None:
         # Given a direct fallback record captured from an outer group forward message.
         plugin = self._plugin()
 
@@ -118,10 +118,12 @@ class RecordFailureHandlingTest(unittest.TestCase):
             "source_self_id": "10000",
         }
 
-        # When the record is sent one-way to a newly joined group member.
+        # When the record is sent to a newly joined group member.
         asyncio.run(plugin._send_record(bot, "789", record, {}, "456"))
 
-        # Then the first route forwards the untouched outer group message to that user.
+        # Then the first attempt references the untouched outer group message.
+        # NapCat resolves this action to ordinary C2C when user_id is present;
+        # group_id does not guarantee a non-friend group temporary session.
         self.assertEqual(
             bot.calls,
             [
