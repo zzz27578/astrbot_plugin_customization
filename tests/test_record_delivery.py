@@ -172,6 +172,42 @@ class RealNapCatInlineNested(FakeNapCat):
         raise AssertionError(f"unexpected NapCat action: {action}")
 
 
+class RealNapCatInlineNestedForwardType(FakeNapCat):
+    """Simulates NapCat returning type:forward with inline data.content array."""
+
+    async def call_action(self, action: str, **params: Any) -> dict[str, Any]:
+        self.calls.append((action, params))
+        if action == "get_forward_msg" and params["id"] == "forward-with-content":
+            return {
+                "messages": [
+                    {
+                        "sender": {"user_id": 10001, "nickname": "甲"},
+                        "message": [
+                            {
+                                "type": "forward",
+                                "data": {
+                                    "id": "inner-id-should-not-call",
+                                    "content": [
+                                        {
+                                            "sender": {"user_id": 10002, "nickname": "乙"},
+                                            "message": [
+                                                {"type": "text", "data": {"text": "内联内容"}},
+                                            ],
+                                        },
+                                    ],
+                                },
+                            },
+                        ],
+                    },
+                ],
+            }
+        if action == "get_forward_msg" and "inner" in params.get("id", ""):
+            raise RuntimeError("消息已过期或者为内层消息，无法获取转发消息")
+        if action == "send_private_forward_msg":
+            return {"status": "ok", "retcode": 0, "message_id": 890}
+        raise AssertionError(f"unexpected NapCat action: {action}")
+
+
 class RecordDeliveryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -305,6 +341,32 @@ class RecordDeliveryTest(unittest.TestCase):
         self.assertEqual(nested_data["user_id"], 10002)
         self.assertEqual(nested_data["nickname"], "乙")
         self.assertEqual(nested_data["content"][0]["data"]["text"], "真实内层")
+
+    def test_parses_forward_type_with_inline_content_array(self) -> None:
+        """NapCat may return type:forward with data.content already expanded."""
+        plugin = self.module.WelcomeCustomizationPlugin.__new__(
+            self.module.WelcomeCustomizationPlugin,
+        )
+        plugin.store = {"settings": {}, "records": {}}
+        plugin._save = lambda: None
+        bot = RealNapCatInlineNestedForwardType()
+
+        nodes = asyncio.run(
+            plugin._record_nodes_from_forward(bot, "forward-with-content", {}),
+        )
+
+        get_calls = [c for c in bot.calls if c[0] == "get_forward_msg"]
+        self.assertEqual(len(get_calls), 1, "Should only call outer get_forward_msg")
+        self.assertEqual(get_calls[0][1]["id"], "forward-with-content")
+
+        self.assertEqual(len(nodes), 1)
+        outer_content = nodes[0]["content"]
+        self.assertEqual(len(outer_content), 1)
+        self.assertEqual(outer_content[0]["type"], "node")
+        nested_data = outer_content[0]["data"]
+        self.assertEqual(nested_data["user_id"], 10002)
+        self.assertEqual(nested_data["nickname"], "乙")
+        self.assertEqual(nested_data["content"][0]["data"]["text"], "内联内容")
 
 
 if __name__ == "__main__":
