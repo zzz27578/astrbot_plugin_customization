@@ -1552,6 +1552,7 @@ class WelcomeCustomizationPlugin(Star):
             try:
                 result = await bot.call_action(action, **params)
                 self._ensure_record_action_success(strategy, result)
+                await asyncio.sleep(0.5)
                 return strategy
             except Exception as e:
                 errors.append(f"{strategy}: {e}")
@@ -1614,6 +1615,7 @@ class WelcomeCustomizationPlugin(Star):
             try:
                 result = await bot.call_action(action, **params)
                 self._ensure_record_action_success(strategy, result)
+                await asyncio.sleep(0.5)
                 return strategy
             except Exception as e:
                 errors.append(f"{strategy}: {e}")
