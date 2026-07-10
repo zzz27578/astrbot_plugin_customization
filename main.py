@@ -1055,6 +1055,7 @@ class WelcomeCustomizationPlugin(Star):
                 routing,
                 origin_group_id,
             )
+            await asyncio.sleep(0.5)
             return
         if step == "record":
             record = self._active_item("records", "active_record_id")
@@ -1074,6 +1075,7 @@ class WelcomeCustomizationPlugin(Star):
                 routing,
                 origin_group_id,
             )
+            await asyncio.sleep(0.5)
             return
         if step == "text":
             segments = self._text_segments()
