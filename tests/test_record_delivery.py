@@ -213,12 +213,16 @@ class RecordDeliveryTest(unittest.TestCase):
         asyncio.run(plugin._send_record_nodes(bot, "397605468", nodes, {}))
 
         send_params = bot.calls[-1][1]
-        nested_content = send_params["messages"][0]["data"]["content"]
+        outer_data = send_params["messages"][0]["data"]
+        nested_content = outer_data["content"]
         self.assertEqual(nested_content[0]["type"], "node")
+        self.assertIsInstance(outer_data["user_id"], int)
+        self.assertIsInstance(nested_content[0]["data"]["user_id"], int)
         self.assertEqual(
             nested_content[0]["data"]["content"][0]["data"]["text"],
             "内层",
         )
+        self.assertEqual(send_params["timeout"], 60000)
 
     def test_direct_record_migrates_expired_forward_resource(self) -> None:
         plugin = self.module.WelcomeCustomizationPlugin.__new__(
