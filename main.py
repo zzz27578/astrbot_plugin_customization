@@ -1797,7 +1797,7 @@ class WelcomeCustomizationPlugin(Star):
         origin_group_id: str | None = None,
     ) -> None:
         messages = [
-            {"type": "node", "data": self._record_node_for_send(node)}
+            self._record_node_for_send(node)
             for node in nodes
         ]
         try:
