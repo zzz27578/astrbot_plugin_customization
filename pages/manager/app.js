@@ -282,36 +282,31 @@ function previewFor(item, kind) {
   if (kind === "image") {
     return `<p class="muted">${escapeHtml(item.kind === "local" ? "本地上传图片" : item.source || "")}</p>`;
   }
+  if (kind === "record" && item.mode === "unavailable_legacy") {
+    return `<p class="muted">${escapeHtml(item.migration_error || "旧素材缺少原消息信息，请重新采集。")}</p>`;
+  }
   if (kind === "record" && item.mode === "direct_forward") {
-    const backupCount = item.nodes?.length || 0;
-    const backupText = backupCount ? `本地备份 ${backupCount} 个节点` : "没有本地备份";
-    const staleText = item.external_forward_ids?.length
-      ? ` · ${item.external_forward_ids.length} 个外部引用`
-      : "";
     return `
-      <p class="muted">原消息直转，失败时尝试刷新原消息缓存并使用${escapeHtml(backupText)}。</p>
+      <p class="muted">原消息直转，模拟把被引用的原消息转发给目标 QQ。</p>
       <p class="muted">消息 ${escapeHtml(item.source_message_id || "-")} · 来源群 ${escapeHtml(item.source_group_id || "-")}</p>
-      <p class="muted">优先策略 ${escapeHtml(item.last_strategy || "未探测")}${escapeHtml(staleText)}</p>
+      <p class="muted">资源兜底 ${escapeHtml(item.source_forward_id || "-")} · 最近策略 ${escapeHtml(item.last_strategy || "未探测")}</p>
     `;
   }
-  const externalCount = item.external_forward_ids?.length || 0;
-  const modeText = item.capture_mode === "complete_local"
-    ? "已本地化保存嵌套内容"
-    : externalCount
-      ? `仍有 ${externalCount} 个外部引用`
-      : "发送时使用 OneBot 合并转发消息";
-  return `<p class="muted">${escapeHtml(modeText)}</p>`;
+  return `
+    <p class="muted">原聊天记录资源发送，不展开、不重建嵌套内容。</p>
+    <p class="muted">资源 ${escapeHtml(item.record_forward_id || item.root_forward_id || "-")} · 来源群 ${escapeHtml(item.source_group_id || item.root_forward_group_id || "-")}</p>
+    <p class="muted">原消息兜底 ${escapeHtml(item.source_message_id || "-")} · 最近策略 ${escapeHtml(item.last_strategy || "未探测")}</p>
+  `;
 }
 
 function recordMeta(item) {
-  if (item.mode === "direct_forward") {
-    const backupCount = item.nodes?.length || 0;
-    return backupCount ? `原消息直转 · 备份 ${backupCount} 节点` : "原消息直转 · 无备份";
+  if (item.mode === "unavailable_legacy") {
+    return "旧素材不可用";
   }
-  const externalCount = item.external_forward_ids?.length || 0;
-  return externalCount
-    ? `${item.nodes?.length || 0} 个节点 · ${externalCount} 外部引用`
-    : `${item.nodes?.length || 0} 个节点 · 本地化`;
+  if (item.mode === "direct_forward") {
+    return "原消息直转";
+  }
+  return "原资源发送";
 }
 
 function renderLogs(logs) {
