@@ -1449,7 +1449,13 @@ class WelcomeCustomizationPlugin(Star):
         nodes = record.get("nodes")
         if isinstance(nodes, list) and nodes:
             try:
-                await self._send_record_nodes(bot, user_id, nodes, send_routing)
+                await self._send_record_nodes(
+                    bot,
+                    user_id,
+                    nodes,
+                    send_routing,
+                    origin_group_id or self._record_source_group_id(record) or None,
+                )
                 self._mark_record_send_success(record, "rebuilt_nodes")
                 return
             except Exception as e:
@@ -1474,7 +1480,13 @@ class WelcomeCustomizationPlugin(Star):
                         forward_id,
                         send_routing,
                     )
-                    await self._send_record_nodes(bot, user_id, nodes, send_routing)
+                    await self._send_record_nodes(
+                        bot,
+                        user_id,
+                        nodes,
+                        send_routing,
+                        origin_group_id or self._record_source_group_id(record) or None,
+                    )
                     record["nodes"] = nodes
                     self._mark_record_send_success(record, "rebuilt_nodes")
                     return
@@ -1527,7 +1539,13 @@ class WelcomeCustomizationPlugin(Star):
         nodes = record.get("nodes")
         if isinstance(nodes, list) and nodes:
             try:
-                await self._send_record_nodes(bot, user_id, nodes, direct_routing)
+                await self._send_record_nodes(
+                    bot,
+                    user_id,
+                    nodes,
+                    direct_routing,
+                    origin_group_id or self._record_source_group_id(record) or None,
+                )
                 self._mark_record_send_success(record, "rebuilt_nodes")
                 return
             except Exception as e:
@@ -1553,7 +1571,13 @@ class WelcomeCustomizationPlugin(Star):
                         forward_id,
                         direct_routing,
                     )
-                    await self._send_record_nodes(bot, user_id, nodes, direct_routing)
+                    await self._send_record_nodes(
+                        bot,
+                        user_id,
+                        nodes,
+                        direct_routing,
+                        origin_group_id or self._record_source_group_id(record) or None,
+                    )
                     record["nodes"] = nodes
                     self._mark_record_send_success(record, "rebuilt_nodes")
                     return
@@ -1770,19 +1794,33 @@ class WelcomeCustomizationPlugin(Star):
         user_id: str,
         nodes: list[dict[str, Any]],
         routing: dict[str, Any],
+        origin_group_id: str | None = None,
     ) -> None:
         messages = [
             {"type": "node", "data": self._record_node_for_send(node)}
             for node in nodes
         ]
-        result = await bot.call_action(
-            "send_private_forward_msg",
-            user_id=int(user_id),
-            messages=messages,
-            timeout=60000,
-            **routing,
-        )
-        self._ensure_record_action_success("rebuilt_nodes", result)
+        try:
+            result = await bot.call_action(
+                "send_private_forward_msg",
+                user_id=int(user_id),
+                messages=messages,
+                timeout=60000,
+                **routing,
+            )
+            self._ensure_record_action_success("rebuilt_nodes", result)
+        except Exception as e:
+            if not origin_group_id:
+                raise
+            result = await bot.call_action(
+                "send_forward_msg",
+                user_id=int(user_id),
+                group_id=int(origin_group_id),
+                messages=messages,
+                timeout=60000,
+                **routing,
+            )
+            self._ensure_record_action_success("rebuilt_nodes", result)
 
     def _record_node_for_send(self, node: dict[str, Any]) -> dict[str, Any]:
         content = self._normalize_raw_segments(node.get("content", []))
@@ -1819,6 +1857,10 @@ class WelcomeCustomizationPlugin(Star):
         routing: dict[str, Any],
         depth: int,
     ) -> list[dict[str, Any]]:
+        if depth >= 3:
+            raise RuntimeError(
+                f"嵌套深度超过限制 ({depth})，NapCat 和 QQ 最多支持 3 层转发消息"
+            )
         if not isinstance(message, dict):
             return []
         data = message.get("data") if message.get("type") == "node" else message
@@ -1847,6 +1889,26 @@ class WelcomeCustomizationPlugin(Star):
         nodes: list[dict[str, Any]] = []
         plain_segments: list[dict[str, Any]] = []
         for segment in content:
+            if segment.get("type") == "node" and isinstance(segment.get("data"), dict):
+                if plain_segments:
+                    nodes.append({**base, "content": plain_segments})
+                    plain_segments = []
+                inline_nested = await self._record_nodes_from_message(
+                    bot,
+                    segment,
+                    routing,
+                    depth + 1,
+                )
+                nodes.append(
+                    {
+                        **base,
+                        "content": [
+                            {"type": "node", "data": self._record_node_for_send(child)}
+                            for child in inline_nested
+                        ],
+                    },
+                )
+                continue
             nested_id = self._forward_id_from_segment(segment)
             if not nested_id:
                 plain_segments.append(segment)
