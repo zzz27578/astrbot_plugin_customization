@@ -341,6 +341,9 @@ class WelcomeCustomizationPlugin(Star):
                 "created_at": created_at,
                 "updated_at": updated_at,
             }
+            nodes = value.get("nodes")
+            if isinstance(nodes, list) and nodes:
+                common["nodes"] = nodes
             for key in (
                 "last_strategy",
                 "last_error",
@@ -351,7 +354,12 @@ class WelcomeCustomizationPlugin(Star):
                 if key in value:
                     common[key] = value[key]
 
-            if mode == "direct_forward" or (source_message_id and not forward_id):
+            if nodes and not source_message_id and not forward_id:
+                normalized[item_id] = {
+                    **common,
+                    "mode": "rebuilt_nodes",
+                }
+            elif mode == "direct_forward" or (source_message_id and not forward_id):
                 normalized[item_id] = {
                     **common,
                     "mode": "direct_forward",
@@ -1055,7 +1063,6 @@ class WelcomeCustomizationPlugin(Star):
                 routing,
                 origin_group_id,
             )
-            await asyncio.sleep(0.5)
             return
         if step == "record":
             record = self._active_item("records", "active_record_id")
@@ -1075,7 +1082,6 @@ class WelcomeCustomizationPlugin(Star):
                 routing,
                 origin_group_id,
             )
-            await asyncio.sleep(0.5)
             return
         if step == "text":
             segments = self._text_segments()
@@ -1346,6 +1352,8 @@ class WelcomeCustomizationPlugin(Star):
         return str(record.get("mode") or "") == "direct_forward"
 
     def _record_has_content(self, record: dict[str, Any]) -> bool:
+        if isinstance(record.get("nodes"), list) and record["nodes"]:
+            return True
         if self._record_is_direct(record):
             return bool(self._record_message_id(record))
         return bool(self._record_forward_id(record))
@@ -1411,6 +1419,14 @@ class WelcomeCustomizationPlugin(Star):
     ) -> None:
         send_routing = self._record_send_routing(record, routing)
         errors: list[str] = []
+        nodes = record.get("nodes")
+        if isinstance(nodes, list) and nodes:
+            try:
+                await self._send_record_nodes(bot, user_id, nodes, send_routing)
+                self._mark_record_send_success(record, "rebuilt_nodes")
+                return
+            except Exception as e:
+                errors.append(f"rebuilt_nodes: {e}")
         forward_id = self._record_forward_id(record)
         if forward_id:
             try:
@@ -1425,6 +1441,18 @@ class WelcomeCustomizationPlugin(Star):
                 return
             except Exception as e:
                 errors.append(f"forward_resource: {e}")
+                try:
+                    nodes = await self._record_nodes_from_forward(
+                        bot,
+                        forward_id,
+                        send_routing,
+                    )
+                    await self._send_record_nodes(bot, user_id, nodes, send_routing)
+                    record["nodes"] = nodes
+                    self._mark_record_send_success(record, "rebuilt_nodes")
+                    return
+                except Exception as rebuild_error:
+                    errors.append(f"rebuild_forward: {rebuild_error}")
 
         message_id = self._record_message_id(record)
         if message_id:
@@ -1469,6 +1497,15 @@ class WelcomeCustomizationPlugin(Star):
             except Exception as e:
                 errors.append(f"original_message: {e}")
 
+        nodes = record.get("nodes")
+        if isinstance(nodes, list) and nodes:
+            try:
+                await self._send_record_nodes(bot, user_id, nodes, direct_routing)
+                self._mark_record_send_success(record, "rebuilt_nodes")
+                return
+            except Exception as e:
+                errors.append(f"rebuilt_nodes: {e}")
+
         forward_id = self._record_forward_id(record)
         if forward_id:
             try:
@@ -1483,6 +1520,18 @@ class WelcomeCustomizationPlugin(Star):
                 return
             except Exception as e:
                 errors.append(f"forward_resource_fallback: {e}")
+                try:
+                    nodes = await self._record_nodes_from_forward(
+                        bot,
+                        forward_id,
+                        direct_routing,
+                    )
+                    await self._send_record_nodes(bot, user_id, nodes, direct_routing)
+                    record["nodes"] = nodes
+                    self._mark_record_send_success(record, "rebuilt_nodes")
+                    return
+                except Exception as rebuild_error:
+                    errors.append(f"rebuild_forward_fallback: {rebuild_error}")
 
         error = "；".join(errors) or "原消息直转失败"
         record["last_error"] = error
@@ -1552,7 +1601,6 @@ class WelcomeCustomizationPlugin(Star):
             try:
                 result = await bot.call_action(action, **params)
                 self._ensure_record_action_success(strategy, result)
-                await asyncio.sleep(0.5)
                 return strategy
             except Exception as e:
                 errors.append(f"{strategy}: {e}")
@@ -1615,7 +1663,6 @@ class WelcomeCustomizationPlugin(Star):
             try:
                 result = await bot.call_action(action, **params)
                 self._ensure_record_action_success(strategy, result)
-                await asyncio.sleep(0.5)
                 return strategy
             except Exception as e:
                 errors.append(f"{strategy}: {e}")
@@ -1689,6 +1736,129 @@ class WelcomeCustomizationPlugin(Star):
             ),
         )
         return attempts
+
+    async def _send_record_nodes(
+        self,
+        bot: Any,
+        user_id: str,
+        nodes: list[dict[str, Any]],
+        routing: dict[str, Any],
+    ) -> None:
+        messages = [
+            {"type": "node", "data": self._record_node_for_send(node)}
+            for node in nodes
+        ]
+        result = await bot.call_action(
+            "send_private_forward_msg",
+            user_id=int(user_id),
+            messages=messages,
+            **routing,
+        )
+        self._ensure_record_action_success("rebuilt_nodes", result)
+
+    def _record_node_for_send(self, node: dict[str, Any]) -> dict[str, Any]:
+        content = self._normalize_raw_segments(node.get("content", []))
+        return {
+            "user_id": str(node.get("user_id") or node.get("uin") or "0"),
+            "nickname": str(node.get("nickname") or node.get("name") or "QQ用户"),
+            "content": content,
+        }
+
+    async def _record_nodes_from_forward(
+        self,
+        bot: Any,
+        forward_id: str,
+        routing: dict[str, Any],
+        depth: int = 0,
+    ) -> list[dict[str, Any]]:
+        if depth >= 3:
+            raise RuntimeError("聊天记录嵌套超过 NapCat 支持的 3 层")
+        data = await bot.call_action("get_forward_msg", id=forward_id, **routing)
+        messages = self._extract_forward_messages(data)
+        nodes: list[dict[str, Any]] = []
+        for message in messages:
+            nodes.extend(
+                await self._record_nodes_from_message(bot, message, routing, depth),
+            )
+        if not nodes:
+            raise RuntimeError("NapCat 未返回可重建的聊天记录节点")
+        return nodes
+
+    async def _record_nodes_from_message(
+        self,
+        bot: Any,
+        message: Any,
+        routing: dict[str, Any],
+        depth: int,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(message, dict):
+            return []
+        data = message.get("data") if message.get("type") == "node" else message
+        if not isinstance(data, dict):
+            return []
+        sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
+        base = {
+            "user_id": str(
+                data.get("user_id")
+                or data.get("uin")
+                or sender.get("user_id")
+                or sender.get("uin")
+                or "0"
+            ),
+            "nickname": str(
+                data.get("nickname")
+                or data.get("name")
+                or sender.get("card")
+                or sender.get("nickname")
+                or "QQ用户"
+            ),
+        }
+        content = self._normalize_raw_segments(
+            data.get("content", data.get("message", [])),
+        )
+        nodes: list[dict[str, Any]] = []
+        plain_segments: list[dict[str, Any]] = []
+        for segment in content:
+            nested_id = self._forward_id_from_segment(segment)
+            if not nested_id:
+                plain_segments.append(segment)
+                continue
+            if plain_segments:
+                nodes.append({**base, "content": plain_segments})
+                plain_segments = []
+            nested = await self._record_nodes_from_forward(
+                bot,
+                nested_id,
+                routing,
+                depth + 1,
+            )
+            nodes.append(
+                {
+                    **base,
+                    "content": [
+                        {"type": "node", "data": self._record_node_for_send(child)}
+                        for child in nested
+                    ],
+                },
+            )
+        if plain_segments:
+            nodes.append({**base, "content": plain_segments})
+        return nodes
+
+    def _extract_forward_messages(self, data: Any) -> list[Any]:
+        if isinstance(data, list):
+            return data
+        if not isinstance(data, dict):
+            return []
+        for key in ("messages", "message", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = self._extract_forward_messages(value)
+                if nested:
+                    return nested
+        return []
 
     def _active_item(self, collection: str, active_key: str) -> dict[str, Any] | None:
         item_id = self.store["settings"].get(active_key)
@@ -2246,13 +2416,29 @@ class WelcomeCustomizationPlugin(Star):
             forward_id = await self._extract_record_root_forward_id(event)
         if not forward_id:
             return None
-        return {
+        source_data: dict[str, Any] = {
             "record_forward_id": forward_id,
             "source_message_id": source.get("source_message_id", ""),
             "source_group_id": source.get("source_group_id", ""),
             "source_user_id": source.get("source_user_id", ""),
             "source_self_id": source.get("source_self_id", ""),
         }
+        bot = getattr(event, "bot", None)
+        if bot is not None:
+            routing = (
+                {"self_id": source["source_self_id"]}
+                if source.get("source_self_id")
+                else {}
+            )
+            try:
+                source_data["nodes"] = await self._record_nodes_from_forward(
+                    bot,
+                    forward_id,
+                    routing,
+                )
+            except Exception:
+                logger.exception("聊天记录节点缓存失败，将保留原资源和原消息兜底。")
+        return source_data
 
     async def _extract_record_root_forward_id(self, event: AstrMessageEvent) -> str:
         raw = getattr(event.message_obj, "raw_message", None)
