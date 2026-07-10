@@ -1909,6 +1909,33 @@ class WelcomeCustomizationPlugin(Star):
                     },
                 )
                 continue
+            if segment.get("type") == "forward" and isinstance(
+                segment.get("data", {}).get("content"), list
+            ):
+                if plain_segments:
+                    nodes.append({**base, "content": plain_segments})
+                    plain_segments = []
+                inline_messages = segment["data"]["content"]
+                inline_nested = []
+                for inline_msg in inline_messages:
+                    inline_nested.extend(
+                        await self._record_nodes_from_message(
+                            bot,
+                            inline_msg,
+                            routing,
+                            depth + 1,
+                        )
+                    )
+                nodes.append(
+                    {
+                        **base,
+                        "content": [
+                            {"type": "node", "data": self._record_node_for_send(child)}
+                            for child in inline_nested
+                        ],
+                    },
+                )
+                continue
             nested_id = self._forward_id_from_segment(segment)
             if not nested_id:
                 plain_segments.append(segment)
